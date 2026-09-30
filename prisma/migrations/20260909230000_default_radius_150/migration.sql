@@ -1,0 +1,11 @@
+-- Back to 150 m, and the accuracy budget loosened from a fifth of the radius to
+-- a third.
+--
+-- Measured on the live instance before deciding: real marks land 8-65 m from the
+-- office with a reported accuracy of 3-8 m. 100 m left a 65 m arrival with 35 m
+-- of room -- fine on paper, thin for a car park, a gate and a lift lobby.
+--
+-- The cap stays at 35 m. A third of a large fence would climb past the point
+-- where a reading can decide anything at all, and 35 m remains the worst
+-- evidence this product will act on whatever the radius says.
+ALTER TABLE "WorkLocation" ALTER COLUMN "radiusMeters" SET DEFAULT 150;

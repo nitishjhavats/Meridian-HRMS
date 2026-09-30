@@ -1,0 +1,5 @@
+# Shell scripts must keep LF endings. A CRLF shebang makes the kernel look for
+# an interpreter called "/bin/sh", and the container dies with a "no such file
+# or directory" that names a file which plainly exists.
+*.sh text eol=lf
+Dockerfile text eol=lf

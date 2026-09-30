@@ -1,0 +1,21 @@
+-- A SUPERVISOR role, between TEAM_LEAD and TEAM_MEMBER.
+--
+-- Someone who may stand at an office device and vouch for an employee whose
+-- face will not scan, and who has none of the other powers that came bundled
+-- with the only two ways of doing that job before: MANAGER, which also
+-- confirms people off probation and corrects a whole team's attendance, and a
+-- hand-granted `attendance.override` an administrator had to know to look for.
+--
+-- The same two rules as the MANAGER migration, for the same reasons:
+--
+-- 1. `AFTER 'TEAM_LEAD'`. Prisma generates a bare `ADD VALUE`, which appends to
+--    the end of the type -- past KIOSK. Postgres orders an enum by declaration
+--    order and `findApprover` reads that order, so an appended SUPERVISOR would
+--    sort below an office device.
+--
+-- 2. Nothing else in this file. Postgres refuses a new enum value used in the
+--    same transaction that created it, and Prisma wraps each migration in one.
+--
+-- There is no `DROP VALUE` in PostgreSQL. If this turns out to be wrong it gets
+-- renamed; it does not get removed.
+ALTER TYPE "SystemRole" ADD VALUE 'SUPERVISOR' AFTER 'TEAM_LEAD';

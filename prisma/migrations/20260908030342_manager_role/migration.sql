@@ -1,0 +1,15 @@
+-- A MANAGER role, between HR_MANAGER and TEAM_LEAD.
+--
+-- Two things this migration must not lose:
+--
+-- 1. `AFTER 'HR_MANAGER'`. Prisma generates a bare `ADD VALUE`, which appends
+--    to the end of the type -- past KIOSK. Postgres orders an enum by
+--    declaration order, and `findApprover` reads that order to pick a fallback
+--    approver, so an appended MANAGER would sort below an office device.
+--
+-- 2. Nothing else in this file. Postgres refuses a new enum value used in the
+--    same transaction that created it, and Prisma wraps each migration in one.
+--
+-- There is no `DROP VALUE` in PostgreSQL. If this role turns out to be wrong it
+-- gets renamed; it does not get removed.
+ALTER TYPE "SystemRole" ADD VALUE 'MANAGER' AFTER 'HR_MANAGER';

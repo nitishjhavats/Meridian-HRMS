@@ -1,0 +1,2978 @@
+// HRMS + Payroll — multi-tenant schema
+// Money is stored as INTEGER MINOR UNITS (paise). Percentages are Decimal.
+
+generator client {
+  provider      = "prisma-client-js"
+  // The image builds and runs on node:22-slim (Debian bookworm, OpenSSL 3).
+  // Naming it explicitly means a `prisma generate` run on a developer's
+  // Windows machine still produces an engine the container can use.
+  binaryTargets = ["native", "debian-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================ ENUMS
+
+enum SystemRole {
+  SUPERADMIN
+  ORG_OWNER
+  ADMIN
+  HR_MANAGER
+  /// Between HR and a team lead: runs a team, confirms their own people off
+  /// probation, corrects their own team's attendance. Declaration order is
+  /// seniority here and `findApprover` reads it, so this member has to sit in
+  /// the right place -- the migration says `AFTER 'HR_MANAGER'` by hand,
+  /// because `ALTER TYPE ... ADD VALUE` appends otherwise.
+  MANAGER
+  TEAM_LEAD
+  /// Authorises an override at an office device, and nothing else.
+  ///
+  /// Not a seniority tier: a supervisor is a team member who may stand at the
+  /// kiosk and vouch for somebody whose face will not scan. That power used to
+  /// require MANAGER -- which also confirms people off probation and corrects a
+  /// whole team's attendance -- or a hand-granted `attendance.override`, so in
+  /// practice offices handed out far more than they meant to.
+  ///
+  /// Same rule as MANAGER above: declaration order is seniority and
+  /// `findApprover` reads it, so the migration places this AFTER 'TEAM_LEAD'
+  /// by hand.
+  SUPERVISOR
+  TEAM_MEMBER
+  /// A shared screen left in an office. Not a person: it holds no employee
+  /// record, consumes no seat, and can do nothing but mark attendance.
+  KIOSK
+}
+
+enum UserStatus {
+  INVITED
+  ACTIVE
+  SUSPENDED
+  DISABLED
+}
+
+enum OrgStatus {
+  PENDING_PAYMENT
+  ACTIVE
+  SUSPENDED
+  ARCHIVED
+}
+
+enum SubscriptionStatus {
+  TRIAL
+  ACTIVE
+  PAST_DUE
+  SUSPENDED
+  EXPIRED
+}
+
+enum PaymentOrderStatus {
+  INITIATED
+  AWAITING_CONFIRMATION
+  INFO_REQUESTED
+  APPROVED
+  REJECTED
+  EXPIRED
+}
+
+enum EmploymentState {
+  TRAINING
+  PROBATION
+  /// Permanent from the first day: hired without a trial period.
+  REGULAR
+  /// Permanent, having completed training or probation. `confirmationDate`
+  /// records the day it happened.
+  ///
+  /// REGULAR and CONFIRMED are **identical for pay** -- the payroll engine
+  /// distinguishes only TRAINING, which can carry its own rate through
+  /// `TrainingPlan`. The difference is what the record says about the person,
+  /// which is what a letter and a report need and what pay does not.
+  CONFIRMED
+  NOTICE_PERIOD
+  RESIGNED
+  TERMINATED
+  INACTIVE
+}
+
+enum EmploymentType {
+  FULL_TIME
+  PART_TIME
+  CONTRACT
+  INTERN
+  CONSULTANT
+}
+
+enum WorkMode {
+  ONSITE
+  REMOTE
+  HYBRID
+}
+
+enum Gender {
+  MALE
+  FEMALE
+  OTHER
+  UNDISCLOSED
+}
+
+enum AttendanceStatus {
+  FULL_DAY
+  HALF_DAY
+  ABSENT
+  WEEK_OFF
+  DAY_OFF
+  HOLIDAY
+  EXTRA_DAY
+  PAID_LEAVE
+  UNPAID_LEAVE
+  TRAINING_DAY
+  ON_DUTY
+  NOT_MARKED
+  /// Checked in, not checked out, day still open. Never final: a check-out
+  /// or the nightly close replaces it. See `settleOpenDay` in the domain.
+  CHECKED_IN
+}
+
+enum AttendanceEventType {
+  CHECK_IN
+  CHECK_OUT
+  BREAK_START
+  BREAK_END
+}
+
+enum AttendanceSource {
+  SELF_GPS
+  ADMIN_MANUAL
+  IMPORT
+  SYSTEM
+  /// Marked on a shared office device, for somebody standing at it.
+  KIOSK
+}
+
+/// Why a kiosk mark was accepted without a face match. Both are recorded and
+/// both raise the review flag; neither is a normal way to mark a day.
+enum KioskBypass {
+  /// A single-use PIN issued by an admin or the employee's reporting manager.
+  PIN
+  /// A supervisor stood at the device and entered their own credentials.
+  SUPERVISOR
+}
+
+/// Who a reception device lists.
+///
+/// The roster was the whole organisation and nothing else, because a device
+/// marks attendance for whoever walks up to it. That is right for one office
+/// and wrong for a company with four branches, where a receptionist scrolls
+/// past two hundred names to find the twelve who work in that building.
+///
+/// Asked when the device is created, changeable afterwards. Existing devices
+/// keep `ORGANISATION`, which is what they do today -- a column default that
+/// narrowed on deploy would make people vanish from screens overnight with no
+/// explanation on the screen they vanished from.
+enum KioskRosterScope {
+  ORGANISATION
+  WORK_LOCATION
+}
+
+model KioskDevice {
+  id             String    @id @default(cuid())
+  organizationId String
+  /// The KIOSK-role login this device signs in as.
+  userId         String    @unique
+  /// Where the device stands. It *is* the geofence: a reception desktop has no
+  /// GPS, so this location supplies the coordinates on every mark it makes.
+  workLocationId String
+  label          String
+  /// Whether this screen lists the whole organisation or only its own branch.
+  /// Employees with no work location at all appear on an ORGANISATION device
+  /// and on no WORK_LOCATION one, which the create form warns about by name.
+  rosterScope    KioskRosterScope @default(ORGANISATION)
+  createdAt      DateTime  @default(now())
+  createdById    String?
+  revokedAt      DateTime?
+  lastSeenAt     DateTime?
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  workLocation WorkLocation @relation(fields: [workLocationId], references: [id], onDelete: Restrict)
+
+  @@index([organizationId, revokedAt])
+}
+
+/// A one-shot code that lets somebody mark attendance at a kiosk when the face
+/// check will not pass — a new beard, a bandage, no enrolment yet.
+///
+/// Short-lived and single-use by design, so a six-digit secret is safe: it
+/// expires in minutes, it is spent on first use, and attempts are rate limited.
+/// Nothing long-lived is ever written down or left on the device.
+model AttendancePin {
+  id             String    @id @default(cuid())
+  organizationId String
+  employeeId     String
+  /// SHA-256. The plaintext is shown once, to whoever issued it.
+  codeHash       String
+  issuedById     String
+  /// @unreachable-ok never read; `createdAt` is what the expiry is measured from
+  issuedAt       DateTime  @default(now())
+  expiresAt      DateTime
+  usedAt         DateTime?
+  reason         String?
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  employee     Employee     @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, employeeId, expiresAt])
+  @@index([codeHash])
+}
+
+/**
+ * Who an administrator has said may issue an attendance PIN.
+ * A PIN is the way past a face check that will not pass -- a scar, a new beard,
+ * a camera that cannot see in the dark -- so the question "who may hand one
+ * out?" is a real access decision and used to have no answer at all: the code
+ * fell back to `attendance.override` or being somebody's reporting manager,
+ * neither of which an administrator could see, let alone change.
+ * Two levels, mirroring how permissions already work here: name a designation
+ * and everybody holding it may issue, or name one person. A row of either kind
+ * grants; there is no deny row, because an administrator removing somebody's
+ * authority should remove the row rather than add a second one contradicting
+ * the first.
+ */
+model AttendancePinAuthority {
+  id             String   @id @default(cuid())
+  organizationId String
+  /// Exactly one of these three is set.
+  designationId  String?
+  employeeId     String?
+  /// A whole login role -- "every HR manager", "every team lead". Owner and
+  /// Admin are never rows: they hold `attendance.pin.issue` from the role bundle.
+  role           SystemRole?
+  createdAt      DateTime @default(now())
+  createdById    String?
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  designation  Designation? @relation(fields: [designationId], references: [id], onDelete: Cascade)
+  employee     Employee?    @relation("PinAuthority", fields: [employeeId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, designationId])
+  @@unique([organizationId, employeeId])
+  @@unique([organizationId, role])
+  @@index([organizationId])
+}
+
+enum WeeklyOffType {
+  FIXED
+  MULTIPLE
+  ROTATIONAL
+  CUSTOM
+}
+
+enum HolidayType {
+  PUBLIC
+  ORGANISATION
+  OPTIONAL
+  REGIONAL
+}
+
+enum LeaveDayPart {
+  FULL
+  FIRST_HALF
+  SECOND_HALF
+}
+
+enum LeaveRequestStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CANCELLED
+  WITHDRAWN
+}
+
+enum ComponentKind {
+  EARNING
+  DEDUCTION
+}
+
+enum PayrollRunStatus {
+  DRAFT
+  CALCULATED
+  APPROVED
+  LOCKED
+  CANCELLED
+}
+
+enum PaymentSettlementStatus {
+  UNPAID
+  PARTIALLY_PAID
+  PAID
+}
+
+enum AdvanceStatus {
+  ACTIVE
+  RECOVERED
+  WRITTEN_OFF
+  CANCELLED
+}
+
+enum DocumentStatus {
+  PENDING_VERIFICATION
+  VERIFIED
+  REJECTED
+  EXPIRED
+}
+
+enum ApprovalStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum LetterStatus {
+  DRAFT
+  ISSUED
+  REVOKED
+}
+
+enum PasswordResetStatus {
+  PENDING
+  RELEASED
+  CONSUMED
+  REJECTED
+  EXPIRED
+}
+
+enum ReportingType {
+  PRIMARY
+  SECONDARY
+  FUNCTIONAL
+  PROJECT
+}
+
+enum NotificationStatus {
+  UNREAD
+  READ
+  ARCHIVED
+}
+
+enum PolicyKind {
+  ATTENDANCE
+  PAYROLL
+  LEAVE
+  WEEKLY_OFF
+  TRAINING
+  LETTER
+  SECURITY
+  FNF
+}
+
+enum BillingMode {
+  TRIAL
+  PAID
+  FREE_INTERNAL
+}
+
+/// How long a paid period runs before it renews. Trials ignore this — their
+/// length is the trial itself.
+enum BillingCycle {
+  MONTHLY
+  QUARTERLY
+  HALF_YEARLY
+  ANNUAL
+}
+
+enum ConfirmationMode {
+  UTR
+  CODE
+  BOTH
+}
+
+enum ExitType {
+  RESIGNATION
+  TERMINATION
+  RETIREMENT
+  ABSCONDING
+  END_OF_CONTRACT
+}
+
+enum ExitStatus {
+  INITIATED
+  NOTICE_PERIOD
+  CLEARANCE
+  SETTLED
+  CANCELLED
+}
+
+enum FnfStatus {
+  DRAFT
+  CALCULATED
+  APPROVED
+  PAID
+  CANCELLED
+}
+
+enum ClaimStatus {
+  DRAFT
+  SUBMITTED
+  APPROVED
+  REJECTED
+  PAID
+  CANCELLED
+}
+
+enum AssetStatus {
+  AVAILABLE
+  ASSIGNED
+  IN_REPAIR
+  RETIRED
+  LOST
+}
+
+enum TaskStatus {
+  PENDING
+  IN_PROGRESS
+  COMPLETED
+  SKIPPED
+}
+
+enum GoalStatus {
+  DRAFT
+  ACTIVE
+  ACHIEVED
+  MISSED
+  CANCELLED
+}
+
+enum ReviewCycleStatus {
+  DRAFT
+  ACTIVE
+  CLOSED
+}
+
+enum ReviewStatus {
+  NOT_STARTED
+  SELF_REVIEW
+  MANAGER_REVIEW
+  COMPLETED
+}
+
+enum RegularisationStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CANCELLED
+}
+
+enum ExportStatus {
+  QUEUED
+  RUNNING
+  READY
+  FAILED
+  EXPIRED
+}
+
+// ============================================================ PLATFORM
+
+model PlatformSetting {
+  id                   String           @id @default("singleton")
+  pricePerUserPaise    Int              @default(5900)
+  currency             String           @default("INR")
+  /// Billing period the price applies to. MONTHLY per the product decision.
+  /// @unreachable-ok billing is monthly everywhere; nothing offers another period
+  billingPeriod        String           @default("MONTHLY")
+  /// Leads the platform's own invoice numbers: BMG-2026-0015.
+  ///
+  /// The organisation prefix answers "whose employee is this"; this one
+  /// answers "who issued this invoice", and the issuer is always the platform.
+  invoicePrefix        String           @default("BMG") @db.VarChar(4)
+  paymentUpiId         String           @default("8434232412@ptyes")
+  paymentPayeeName     String           @default("HRMS Platform")
+  /// Platform-wide logo. Falls back to the built-in mark when unset, and is
+  /// what the PWA icons are generated from.
+  logoKey              String?
+  paymentWindowMinutes Int              @default(240)
+  /// UTR = org submits a reference; CODE = superadmin issues a code; BOTH = either.
+  confirmationMode     ConfirmationMode @default(BOTH)
+  otpTtlMinutes        Int              @default(15)
+  defaultTrialDays     Int              @default(14)
+  /// Whether anyone may create an organisation without a Superadmin.
+  selfSignupEnabled    Boolean          @default(true)
+  /// Seats a self-signed-up organisation starts with.
+  signupSeats          Int              @default(5)
+  /// Days a seat-limit breach is tolerated before activation is blocked. 0 = block immediately.
+  seatGraceDays        Int              @default(0)
+  /// Attendance selfies are purged after this many days; the record is kept.
+  selfieRetentionDays  Int              @default(60)
+  /// @unreachable-ok web push was never built -- no subscription is ever written either
+  pushVapidPublicKey   String?
+  defaultAiModel       String           @default("z-ai/glm-5.3-flash")
+  maintenanceMode      Boolean          @default(false)
+  /// When the nightly maintenance run last finished. Read by `/api/health?deep=1`
+  /// so an uptime check can see a night that did not happen: a live container
+  /// and a cron that stopped firing look identical from outside.
+  lastMaintenanceAt    DateTime?
+  /// @unreachable-ok superseded by FeatureGrant and OrgModuleSetting, which are the two levels the product actually has
+  featureFlags         Json             @default("{}")
+  updatedAt            DateTime         @updatedAt
+  updatedById          String?
+}
+
+/// A slug an organisation used to live at.
+///
+/// `/o/<slug>` is printed on emails, bookmarked, and baked into the start URL of
+/// every installed PWA, so renaming one would otherwise quietly strand all
+/// three: the old address still loads, but it resolves to nobody and serves the
+/// product's own name and icon instead of the company's.
+///
+/// Kept as rows rather than an array on the organisation so the unique index is
+/// real: a slug any company has *ever* used cannot be taken by another, or one
+/// address would point at two.
+model OrganizationSlug {
+  id             String   @id @default(cuid())
+  organizationId String
+  slug           String   @unique
+  createdAt      DateTime @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId])
+}
+
+model Organization {
+  id                       String    @id @default(cuid())
+  name                     String
+  legalName                String?
+  slug                     String    @unique
+  logoKey                  String?
+  /// The company seal, printed beside the signature on a letter. One per
+  /// company, unlike `LetterTemplate.signatureKey`, which is per letter type
+  /// because different letters are signed by different people.
+  stampKey                 String?
+  /// The authorised signatory, for every letter this organisation issues.
+  ///
+  /// The signature used to live only on `LetterTemplate`, one row per letter
+  /// category, uploaded inside the template editor one category at a time. So
+  /// uploading it for the offer letter left the other nine unsigned, and there
+  /// was nowhere in organisation settings to put it at all -- which is why it
+  /// "did not appear in letters". The stamp was already here; the signature
+  /// belongs beside it.
+  ///
+  /// A template may still override all three, for the rare letter somebody else
+  /// signs. Absent there means "use the organisation's".
+  signatureKey             String?
+  signatoryName            String?
+  signatoryTitle           String?
+  email                    String?
+  phone                    String?
+  website                  String?
+  industry                 String?
+  addressLine1             String?
+  addressLine2             String?
+  city                     String?
+  state                    String?
+  country                  String    @default("India")
+  postalCode               String?
+  /// Statutory identifiers an offer or appointment letter has to quote. They
+  /// belong to the organisation, and letters read them through the placeholder
+  /// catalogue like any other organisation field.
+  cin                      String?
+  gstin                    String?
+  panNumber                String?
+  tan                      String?
+  pfCode                   String?
+  esiCode                  String?
+  timezone                 String    @default("Asia/Kolkata")
+  currency                 String    @default("INR")
+  locale                   String    @default("en-IN")
+  status                   OrgStatus @default(PENDING_PAYMENT)
+  seatLimit                Int       @default(0)
+  /// @unreachable-ok superseded by OrgModuleSetting; module state is two-level and lives there
+  enabledFeatures          Json      @default("[]")
+  /// @unreachable-ok payroll and leave both run on the calendar year; nothing reads this
+  fiscalYearStartMonth     Int       @default(4)
+  /// How many days a new hire stays on probation, unless the person adding them
+  /// says otherwise. Ninety is the common default in Indian employment; it is a
+  /// starting point for the form, not a rule the product enforces.
+  /// The last year the default-on holidays were filled in for.
+  ///
+  /// The three national days arrive on and arrive again every year, and an
+  /// organisation can switch one off. Those two only coexist because of this
+  /// column: the maintenance job seeds forward from it and records that it did,
+  /// so it never revisits a year -- and a holiday somebody deleted stays
+  /// deleted rather than reappearing on the next run.
+  holidaysSeededThrough    Int?
+  probationDays            Int       @default(90)
+  /// How long a new hire stays in training, when they start there rather than
+  /// on probation. Thirty days is a common default; like `probationDays` it
+  /// fills in a date on the form and enforces nothing.
+  trainingDays             Int       @default(30)
+  /// The three letters every employee code in this organisation starts with,
+  /// chosen when it is created. It used to be inferred from whichever existing
+  /// code had the highest numeric tail, which picked the wrong one the moment a
+  /// directory held two patterns -- and gave a brand-new organisation "EMP".
+  /// Three or four letters. Leads every number this organisation issues: its
+  /// employee codes, its letters, its expense claims and its payslips.
+  employeeCodePrefix       String    @default("EMP") @db.VarChar(4)
+  /// Whether letters and payslips print the statutory identifiers below the
+  /// address. Off by default: most of them are blank for most organisations,
+  /// and a letterhead listing empty labels looks worse than one without them.
+  /// Kept as the fallback for organisations that have not opened the new
+  /// screen: on used to mean all six identifiers on every document, and that is
+  /// what they keep until they choose otherwise.
+  showStatutoryOnDocuments Boolean   @default(false)
+  /// Which statutory identifiers print on which document. `{ payslip, letter,
+  /// fnf }`, each a list of identifier keys. Null means "never chosen", and
+  /// `resolveDocumentIdentifiers` falls back to the boolean above.
+  documentIdentifiers      Json?
+  createdAt                DateTime  @default(now())
+  updatedAt                DateTime  @updatedAt
+  createdById              String?
+  suspendedAt              DateTime?
+  suspendedReason          String?
+
+  users                 User[]
+  employees             Employee[]
+  departments           Department[]
+  designations          Designation[]
+  designationReportings DesignationReporting[]
+  chatThreads           ChatThread[]
+  chatMessages          ChatMessage[]
+  chatBlocks            ChatBlock[]
+  chatReports           ChatReport[]
+  workLocations         WorkLocation[]
+  shifts                Shift[]
+  holidays              Holiday[]
+  leaveTypes            LeaveType[]
+  carryForwardRuns      LeaveCarryForwardRun[]
+  goalProgress          GoalProgress[]
+  leaveRequests         LeaveRequest[]
+  leaveBalances         LeaveBalance[]
+  attendanceDays        AttendanceDay[]
+  attendanceEvents      AttendanceEvent[]
+  salaryComponents      SalaryComponent[]
+  salaryProfiles        SalaryProfile[]
+  payrollRuns           PayrollRun[]
+  salaryAdvances        SalaryAdvance[]
+  documents             EmployeeDocument[]
+  announcements         Announcement[]
+  letterTemplates       LetterTemplate[]
+  letters               Letter[]
+  aiConfig              AiConfig?
+  subscription          Subscription?
+  paymentOrders         PaymentOrder[]
+  policyVersions        OrgPolicyVersion[]
+  auditLogs             AuditLog[]
+  notifications         Notification[]
+  weeklyOffPatterns     WeeklyOffPattern[]
+  subscriptionHistory   SubscriptionHistory[]
+  coupons               Coupon[]
+  paymentCodes          PaymentCode[]
+  pastSlugs             OrganizationSlug[]
+  featureGrants         FeatureGrant[]
+  moduleSettings        OrgModuleSetting[]
+  seatSnapshots         SeatUsageSnapshot[]
+  exitRecords           ExitRecord[]
+  fnfSettlements        FnfSettlement[]
+  reimbursementClaims   ReimbursementClaim[]
+  recognitionParameters RecognitionParameter[]
+  recognitionCycles     RecognitionCycle[]
+  recognitionAwards     RecognitionAward[]
+  onboardingTemplates   OnboardingTemplate[]
+  onboardingTasks       OnboardingTask[]
+  assets                Asset[]
+  assetAssignments      AssetAssignment[]
+  reviewCycles          ReviewCycle[]
+  goals                 Goal[]
+  performanceReviews    PerformanceReview[]
+  regularisations       AttendanceRegularisation[]
+  dataExports           DataExportJob[]
+  loginEvents           LoginEvent[]
+  kioskDevices          KioskDevice[]
+  attendancePins        AttendancePin[]
+  pinAuthorities        AttendancePinAuthority[]
+  designationModules    DesignationModuleSetting[]
+  designationLeave      DesignationLeaveAllocation[]
+  userModules           UserModuleSetting[]
+
+  @@index([status])
+  @@index([createdAt])
+}
+
+model User {
+  id                 String     @id @default(cuid())
+  organizationId     String?
+  email              String
+  passwordHash       String
+  name               String
+  phone              String?
+  /// @unreachable-ok no avatar upload exists; the shell draws initials
+  avatarKey          String?
+  role               SystemRole
+  status             UserStatus @default(ACTIVE)
+  mustChangePassword Boolean    @default(false)
+  lastLoginAt        DateTime?
+  failedLoginCount   Int        @default(0)
+  lockedUntil        DateTime?
+  passwordChangedAt  DateTime?
+  /// When this person accepted the Terms and Privacy Policy, and which version
+  /// they accepted. An acceptance that is not recorded is not an acceptance —
+  /// "they must have ticked it" is not something anybody can produce later.
+  termsAcceptedAt    DateTime?
+  termsVersion       String?
+  totpSecretCipher   String?
+  totpEnabledAt      DateTime?
+  /// SHA-256 of each unused recovery code. Plaintext is shown once, at enrolment.
+  totpRecoveryHashes String[]   @default([])
+  createdAt          DateTime   @default(now())
+  updatedAt          DateTime   @updatedAt
+
+  organization         Organization?          @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  employee             Employee?
+  sessions             Session[]
+  permissionGrants     UserPermissionGrant[]
+  moduleSettings       UserModuleSetting[]    @relation("ModuleSetting")
+  passwordResets       PasswordResetRequest[]
+  notifications        Notification[]
+  auditLogs            AuditLog[]             @relation("AuditActor")
+  announcements        Announcement[]         @relation("AnnouncementAuthor")
+  announcementLikes    AnnouncementLike[]
+  announcementComments AnnouncementComment[]
+  pushSubscriptions    PushSubscription[]
+  loginEvents          LoginEvent[]
+  kioskDevice          KioskDevice?
+
+  @@unique([organizationId, email])
+  @@index([email])
+  @@index([organizationId, role])
+}
+
+model Session {
+  id          String    @id @default(cuid())
+  userId      String
+  tokenHash   String    @unique
+  ipAddress   String?
+  userAgent   String?
+  /// Friendly label derived from the user agent, e.g. "Chrome on Windows".
+  deviceLabel String?
+  lastSeenAt  DateTime?
+  revokedById String?
+  expiresAt   DateTime
+  revokedAt   DateTime?
+  createdAt   DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model UserPermissionGrant {
+  id         String   @id @default(cuid())
+  userId     String
+  permission String
+  granted    Boolean  @default(true)
+  createdAt  DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, permission])
+}
+
+model PasswordResetRequest {
+  id             String              @id @default(cuid())
+  userId         String
+  organizationId String?
+  requestedEmail String
+  otpHash        String
+  otpCipher      String?
+  status         PasswordResetStatus @default(PENDING)
+  attemptCount   Int                 @default(0)
+  expiresAt      DateTime
+  releasedAt     DateTime?
+  releasedById   String?
+  consumedAt     DateTime?
+  rejectedReason String?
+  ipAddress      String?
+  createdAt      DateTime            @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([status, createdAt])
+  @@index([userId])
+}
+
+// ============================================================ BILLING
+
+model Subscription {
+  id                 String             @id @default(cuid())
+  organizationId     String             @unique
+  seats              Int                @default(0)
+  status             SubscriptionStatus @default(TRIAL)
+  /// Superadmin picks this per organisation: trial, paying, or free/internal.
+  billingMode        BillingMode        @default(TRIAL)
+  /// Renewal period for a paying organisation. Annual is the default because it
+  /// is what every subscription created before this field existed actually got.
+  billingCycle       BillingCycle       @default(ANNUAL)
+  currentPeriodStart DateTime
+  currentPeriodEnd   DateTime
+  trialEndsAt        DateTime?
+  nextBillingDate    DateTime?
+  /// Seat overage tolerated until this instant; null = no grace.
+  graceUntil         DateTime?
+  pricePerUserPaise  Int
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([status, currentPeriodEnd])
+  @@index([billingMode, trialEndsAt])
+}
+
+model SubscriptionHistory {
+  id                String    @id @default(cuid())
+  organizationId    String
+  paymentOrderId    String?
+  previousSeats     Int
+  newSeats          Int
+  previousPeriodEnd DateTime?
+  newPeriodEnd      DateTime
+  amountPaise       Int
+  note              String?
+  createdAt         DateTime  @default(now())
+  createdById       String?
+
+  organization Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  paymentOrder PaymentOrder? @relation(fields: [paymentOrderId], references: [id])
+
+  @@index([organizationId, createdAt])
+}
+
+model Coupon {
+  id               String   @id @default(cuid())
+  code             String   @unique
+  description      String?
+  percent          Decimal  @db.Decimal(5, 2)
+  maxDiscountPaise Int?
+  startsAt         DateTime
+  expiresAt        DateTime
+  maxRedemptions   Int?
+  redemptionCount  Int      @default(0)
+  /// How many times one organisation may use this coupon. Null = as often as
+  /// they like. `maxRedemptions` is the total across everybody; this is the
+  /// per-buyer limit, and without it a single organisation could spend a
+  /// hundred-use launch coupon on its own renewals.
+  maxPerOrganisation Int?
+  minUserCount     Int?
+  maxUserCount     Int?
+  /// Only for an organisation that has never had an order approved. The offer
+  /// that brings somebody in should not keep paying out on their renewals.
+  firstPurchaseOnly Boolean @default(false)
+  /// Whether it appears in the list at checkout.
+  ///
+  /// Off by default, and deliberately: a coupon is private until somebody
+  /// decides to publish it. A code emailed to one customer must not turn up in
+  /// a dropdown for everybody else, and the safe direction for a default that
+  /// reveals a discount is closed.
+  listed           Boolean  @default(false)
+  appliesToOrgId   String?
+  active           Boolean  @default(true)
+  createdAt        DateTime @default(now())
+  createdById      String?
+
+  organization Organization?      @relation(fields: [appliesToOrgId], references: [id], onDelete: SetNull)
+  redemptions  CouponRedemption[]
+  orders       PaymentOrder[]
+
+  @@index([active, startsAt, expiresAt])
+}
+
+model CouponRedemption {
+  id             String   @id @default(cuid())
+  couponId       String
+  paymentOrderId String   @unique
+  organizationId String
+  discountPaise  Int
+  createdAt      DateTime @default(now())
+
+  coupon Coupon @relation(fields: [couponId], references: [id], onDelete: Cascade)
+
+  @@unique([couponId, paymentOrderId])
+  @@index([organizationId])
+}
+
+model PaymentOrder {
+  id                String             @id @default(cuid())
+  organizationId    String
+  orderNumber       String             @unique
+  userCount         Int
+  pricePerUserPaise Int
+  subtotalPaise     Int
+  discountPaise     Int                @default(0)
+  payablePaise      Int
+  couponId          String?
+  couponCode        String?
+  status            PaymentOrderStatus @default(INITIATED)
+  upiId             String
+  periodMonths      Int                @default(12)
+  /// Mode UTR: the reference the organisation typed in.
+  confirmationCode  String?
+  transactionRef    String?
+  payerNote         String?
+  /// Mode CODE: superadmin-issued code. Hash is compared; cipher lets the
+  /// superadmin re-read the code they issued. Both cleared once consumed.
+  issuedCodeHash    String?
+  issuedCodeCipher  String?
+  codeIssuedAt      DateTime?
+  codeIssuedById    String?
+  codeAttemptCount  Int                @default(0)
+  submittedAt       DateTime?
+  reviewedAt        DateTime?
+  reviewedById      String?
+  reviewNote        String?
+  infoRequestNote   String?
+  expiresAt         DateTime
+  windowMinutes     Int
+  previousSeats     Int                @default(0)
+  createdAt         DateTime           @default(now())
+  updatedAt         DateTime           @updatedAt
+  createdById       String?
+
+  organization Organization          @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  coupon       Coupon?               @relation(fields: [couponId], references: [id])
+  history      SubscriptionHistory[]
+  events       PaymentOrderEvent[]
+  /// The advance code applied at checkout or spent at confirmation, if any.
+  paymentCode  PaymentCode?
+
+  @@index([status, createdAt])
+  @@index([organizationId, createdAt])
+  @@index([expiresAt])
+}
+
+/// A code the platform owner hands out before there is an order.
+///
+/// The order-bound confirmation code (`PaymentOrder.issuedCode*`) is issued
+/// against a request already in the queue. This is the other direction: made
+/// on the phone for an organisation that has not yet pressed Buy, optionally
+/// with a discount, optionally tied to one organisation, spent once. Six
+/// digits, like the order-bound code, so the same box accepts both.
+model PaymentCode {
+  id               String    @id @default(cuid())
+  /// SHA-256, so the code can be found by value at checkout and at
+  /// confirmation -- bcrypt cannot be looked up. Guessing is rate-limited and
+  /// every code that was not issued against the order itself still goes
+  /// through approval, so the hash is a lookup key rather than a secret.
+  codeHash         String
+  /// The code itself, encrypted, so the owner can re-read what they handed out.
+  codeCipher       String
+  /// Null means any organisation may use it.
+  organizationId   String?
+  /// Off what is owed at the moment it is applied. Null means the code confirms
+  /// payment and changes nothing.
+  discountPercent  Decimal?  @db.Decimal(5, 2)
+  maxDiscountPaise Int?
+  expiresAt        DateTime
+  /// Who it was given to and why, in the issuer's words.
+  note             String?
+  issuedById       String
+  issuedAt         DateTime  @default(now())
+  /// The order it was applied to at checkout or spent on at confirmation.
+  paymentOrderId   String?   @unique
+  appliedAt        DateTime?
+  usedAt           DateTime?
+  revokedAt        DateTime?
+
+  organization Organization? @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  order        PaymentOrder? @relation(fields: [paymentOrderId], references: [id], onDelete: SetNull)
+
+  @@index([codeHash])
+  @@index([organizationId, issuedAt])
+  @@index([issuedAt])
+}
+
+model PaymentOrderEvent {
+  id             String              @id @default(cuid())
+  paymentOrderId String
+  fromStatus     PaymentOrderStatus?
+  toStatus       PaymentOrderStatus
+  note           String?
+  actorId        String?
+  createdAt      DateTime            @default(now())
+
+  order PaymentOrder @relation(fields: [paymentOrderId], references: [id], onDelete: Cascade)
+
+  @@index([paymentOrderId, createdAt])
+}
+
+// ============================================================ ORG STRUCTURE
+
+model Department {
+  id             String   @id @default(cuid())
+  organizationId String
+  name           String
+  code           String?
+  description    String?
+  /// @unreachable-ok reporting lines are per designation, not per department head
+  headEmployeeId String?
+  active         Boolean  @default(true)
+  createdAt      DateTime @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  employees    Employee[]
+
+  @@unique([organizationId, name])
+  @@index([organizationId])
+}
+
+model Designation {
+  id             String   @id @default(cuid())
+  organizationId String
+  title          String
+  level          Int      @default(0)
+  description    String?
+  active         Boolean  @default(true)
+  createdAt      DateTime @default(now())
+
+  /// Week offs a month this role is owed, overriding the payroll rule.
+  ///
+  /// Null means "whatever the organisation's payroll rules say", which is
+  /// itself allowed to mean "whatever the weekly-off pattern gives". Three
+  /// layers, resolved the same way leave allocation already is: the person's
+  /// designation, then the policy, then the pattern.
+  weekOffsPerMonth Int?
+
+  organization     Organization                 @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  employees        Employee[]
+  reportsTo        DesignationReporting[]       @relation("FromDesignation")
+  reportedBy       DesignationReporting[]       @relation("ToDesignation")
+  pinAuthority     AttendancePinAuthority[]
+  moduleSettings   DesignationModuleSetting[]
+  leaveAllocations DesignationLeaveAllocation[]
+
+  @@unique([organizationId, title])
+  @@index([organizationId])
+}
+
+/// One year-end carry-forward, and enough of the balances it changed to undo it.
+///
+/// `runCarryForward` writes with `set` rather than `increment`, which makes a
+/// re-run harmless and an undo impossible: once the new figure is in, the old
+/// one is gone. Every line's prior value is kept here so a run can be taken
+/// back — and put back again, because somebody who undoes the wrong one should
+/// not have to reconstruct it by hand.
+///
+/// `lines` is a JSON array of { employeeId, leaveTypeId, before, after }, where
+/// `before` is null for a balance row the run created. Kept as JSON rather than
+/// a table because it is read as a whole, written once, and never queried
+/// across runs.
+model LeaveCarryForwardRun {
+  id             String   @id @default(cuid())
+  organizationId String
+  fromYear       Int
+  toYear         Int
+  /// Days actually carried, for the list. The detail is in `lines`.
+  days           Decimal  @default(0) @db.Decimal(8, 2)
+  employees      Int      @default(0)
+  lines          Json
+  ranById        String?
+  ranAt          DateTime @default(now())
+  /// Set when the run has been taken back. A redo clears it again.
+  undoneAt       DateTime?
+  undoneById     String?
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, ranAt])
+}
+
+model DesignationReporting {
+  id                     String        @id @default(cuid())
+  organizationId         String
+  designationId          String
+  reportsToDesignationId String
+  type                   ReportingType @default(PRIMARY)
+  createdAt              DateTime      @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  designation  Designation  @relation("FromDesignation", fields: [designationId], references: [id], onDelete: Cascade)
+  reportsTo    Designation  @relation("ToDesignation", fields: [reportsToDesignationId], references: [id], onDelete: Cascade)
+
+  @@unique([designationId, reportsToDesignationId, type])
+  @@index([organizationId, designationId])
+}
+
+model WorkLocation {
+  id             String   @id @default(cuid())
+  organizationId String
+  name           String
+  /// Street and building. Shown as the first line of a branch's address.
+  address        String?
+  /// Area, city, pin — whatever does not belong on the first line.
+  ///
+  /// A branch address used to be one free-text box, and the reception screen
+  /// never received it at all: the kiosk context selected the location's name
+  /// and its coordinates and nothing else, so a device standing in a building
+  /// could not say which building it was standing in.
+  addressLine2   String?
+  latitude       Decimal  @db.Decimal(10, 7)
+  longitude      Decimal  @db.Decimal(10, 7)
+  radiusMeters   Int      @default(150)
+  requireSelfie  Boolean  @default(true)
+  requireGps     Boolean  @default(true)
+  active         Boolean  @default(true)
+  /// The branch a new employee joins when nobody chooses one for them.
+  ///
+  /// Every employee in production had `workLocationId = NULL`, because the
+  /// employee form lets the field be skipped and nothing filled it in. With no
+  /// work location the geofence is never evaluated at all -- `requireGps` only
+  /// forces coordinates to be *present* -- so attendance was markable from
+  /// anywhere. A default branch is what stops that happening again on the next
+  /// employee somebody adds in a hurry.
+  ///
+  /// At most one per organisation; `setPrimaryWorkLocation` clears the others in
+  /// the same transaction. Where none is marked, the oldest active location is
+  /// used, so an organisation that never thinks about this still gets a fence.
+  isPrimary      Boolean  @default(false)
+  createdAt      DateTime @default(now())
+
+  organization Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  employees    Employee[]
+  kioskDevices KioskDevice[]
+
+  @@unique([organizationId, name])
+  @@index([organizationId, isPrimary])
+}
+
+model Shift {
+  id              String   @id @default(cuid())
+  organizationId  String
+  name            String
+  startTime       String
+  endTime         String
+  breakMinutes    Int      @default(60)
+  graceMinutes    Int      @default(10)
+  isDefault       Boolean  @default(false)
+  crossesMidnight Boolean  @default(false)
+  active          Boolean  @default(true)
+  createdAt       DateTime @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  employees    Employee[]
+
+  @@unique([organizationId, name])
+}
+
+model WeeklyOffPattern {
+  id             String        @id @default(cuid())
+  organizationId String
+  name           String
+  type           WeeklyOffType @default(FIXED)
+  // FIXED:      { "days": [0] }                                   (0 = Sunday)
+  // MULTIPLE:   { "days": [0, 6] }
+  // ROTATIONAL: { "days": [0], "rotating": [{ "day": 6, "weeks": [2, 4] }] }
+  // CUSTOM:     { "dates": ["2026-01-04"] }
+  config         Json
+  isDefault      Boolean       @default(false)
+  active         Boolean       @default(true)
+  createdAt      DateTime      @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  employees    Employee[]
+
+  @@unique([organizationId, name])
+}
+
+model Holiday {
+  id             String      @id @default(cuid())
+  organizationId String
+  name           String
+  date           DateTime    @db.Date
+  type           HolidayType @default(PUBLIC)
+  paid           Boolean     @default(true)
+  optional       Boolean     @default(false)
+  regions        String[]    @default([])
+  departmentIds  String[]    @default([])
+  employeeIds    String[]    @default([])
+  note           String?
+  createdAt      DateTime    @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, name, date])
+  @@index([organizationId, date])
+}
+
+// ============================================================ EMPLOYEES
+
+model Employee {
+  id             String  @id @default(cuid())
+  organizationId String
+  userId         String? @unique
+  employeeCode   String
+
+  firstName         String
+  lastName          String?
+  photoKey          String?
+  gender            Gender?
+  dateOfBirth       DateTime? @db.Date
+  personalEmail     String?
+  workEmail         String?
+  phone             String?
+  addressLine1      String?
+  addressLine2      String?
+  city              String?
+  state             String?
+  country           String?
+  postalCode        String?
+  emergencyName     String?
+  emergencyPhone    String?
+  emergencyRelation String?
+  /// Health data under the SPDI Rules, and it sat in plaintext beside encrypted
+  /// bank details for as long as the column existed. Encrypted like the rest;
+  /// the emergency contact who needs it is the only reason it is collected.
+  bloodGroupCipher  String?
+  /// The plaintext it replaced. Kept only until `npm run migrate:bloodgroup` has
+  /// run everywhere; the app writes the cipher and reads it first, falling back
+  /// to this. Dropping it in the same migration that added the cipher would
+  /// have thrown away data the customer typed, because SQL cannot encrypt it.
+  bloodGroup        String?
+
+  joiningDate        DateTime        @db.Date
+  confirmationDate   DateTime?       @db.Date
+  exitDate           DateTime?       @db.Date
+  departmentId       String?
+  designationId      String?
+  workLocationId     String?
+  shiftId            String?
+  weeklyOffPatternId String?
+  /// This person's own rest days, when they differ from every named pattern:
+  /// `{ type: "FIXED", days: [2] }` or `{ type: "MULTIPLE", days: [2, 5] }`.
+  /// Consulted before the named pattern and the organisation default. Null
+  /// means "as the pattern says". Set from the Week off card on the profile.
+  weeklyOffConfig    Json?
+  /// This person's own paid week-off quota a month. Null falls through to the
+  /// designation, then to the payroll rule -- the same three layers leave
+  /// allocation already has.
+  weekOffsPerMonth   Int?
+  employmentType     EmploymentType  @default(FULL_TIME)
+  workMode           WorkMode        @default(ONSITE)
+  employmentState    EmploymentState @default(REGULAR)
+  active             Boolean         @default(true)
+
+  /// Overrides the organisation's `marking.self` attendance rule for this one
+  /// person. Null means "follow the organisation", which is what every row says
+  /// until somebody decides otherwise. It exists so that an organisation moving
+  /// to office-device-only does not lock out the field staff whose job is to be
+  /// somewhere else. Resolved by `mayMarkFromOwnDevice` in
+  /// src/domain/attendance/policy.ts.
+  allowSelfMarking Boolean?
+
+  panCipher         String?
+  aadhaarCipher     String?
+  bankNameCipher    String?
+  bankAccountCipher String?
+  bankIfscCipher    String?
+  uanCipher         String?
+  pfNumberCipher    String?
+
+  /// Reference photo used to verify attendance selfies.
+  facePhotoKey         String?
+  /// The 128-d descriptor derived from it, encrypted at rest. Biometric data:
+  /// it is never returned to a client and is deleted with the enrolment.
+  faceDescriptorCipher String?
+  faceEnrolledAt       DateTime?
+  faceEnrolledById     String?
+  /// When the employee agreed to face verification.
+  faceConsentAt        DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  organization     Organization      @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  user             User?             @relation(fields: [userId], references: [id], onDelete: SetNull)
+  department       Department?       @relation(fields: [departmentId], references: [id], onDelete: SetNull)
+  designation      Designation?      @relation(fields: [designationId], references: [id], onDelete: SetNull)
+  workLocation     WorkLocation?     @relation(fields: [workLocationId], references: [id], onDelete: SetNull)
+  shift            Shift?            @relation(fields: [shiftId], references: [id], onDelete: SetNull)
+  weeklyOffPattern WeeklyOffPattern? @relation(fields: [weeklyOffPatternId], references: [id], onDelete: SetNull)
+
+  managers          ReportingRelationship[] @relation("Subordinate")
+  reports           ReportingRelationship[] @relation("Manager")
+  chatThreadsA      ChatThread[]            @relation("ChatThreadA")
+  chatThreadsB      ChatThread[]            @relation("ChatThreadB")
+  chatMessages      ChatMessage[]           @relation("ChatMessageSender")
+  chatBlocksMade    ChatBlock[]             @relation("ChatBlocker")
+  chatBlocksAgainst ChatBlock[]             @relation("ChatBlocked")
+  chatReports       ChatReport[]            @relation("ChatReporter")
+  stateHistory      EmploymentStateChange[]
+  trainingPlans     TrainingPlan[]
+  salaryProfiles    SalaryProfile[]
+  attendanceDays    AttendanceDay[]
+  attendanceEvents  AttendanceEvent[]
+  leaveRequests     LeaveRequest[]
+  leaveBalances     LeaveBalance[]
+  payrollItems      PayrollItem[]
+  advances          SalaryAdvance[]
+  documents         EmployeeDocument[]
+  letters           Letter[]
+
+  exitRecord          ExitRecord?
+  fnfSettlements      FnfSettlement[]
+  reimbursementClaims ReimbursementClaim[]
+  onboardingTasks     OnboardingTask[]
+  assetAssignments    AssetAssignment[]
+  goals               Goal[]
+  performanceReviews  PerformanceReview[]        @relation("ReviewSubject")
+  reviewsGiven        PerformanceReview[]        @relation("ReviewReviewer")
+  regularisations     AttendanceRegularisation[]
+  attendancePins      AttendancePin[]
+  pinAuthority        AttendancePinAuthority[]   @relation("PinAuthority")
+  payrollAdjustments  PayrollAdjustment[]
+  recognitionScores   RecognitionScore[]
+  recognitionAwards   RecognitionAward[]
+
+  @@unique([organizationId, employeeCode])
+  @@index([organizationId, active])
+  @@index([organizationId, departmentId])
+  @@index([organizationId, employmentState])
+}
+
+/// Employee-to-employee messaging.
+///
+/// One thread per pair, forever. The pair is stored in a canonical order --
+/// `employeeAId < employeeBId` -- so a conversation cannot be opened twice from
+/// the two ends and produce two unread counts nobody can reconcile.
+///
+/// The thread outlives the messages: they are purged after thirty days; the
+/// pair's identity and each side's read position are not.
+model ChatThread {
+  id             String    @id @default(cuid())
+  organizationId String
+  employeeAId    String
+  employeeBId    String
+  lastMessageAt  DateTime?
+  /// When each side last opened it. Marking a conversation read is then one
+  /// UPDATE rather than one per message.
+  aLastReadAt    DateTime?
+  bLastReadAt    DateTime?
+  createdAt      DateTime  @default(now())
+
+  organization Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  employeeA    Employee      @relation("ChatThreadA", fields: [employeeAId], references: [id], onDelete: Cascade)
+  employeeB    Employee      @relation("ChatThreadB", fields: [employeeBId], references: [id], onDelete: Cascade)
+  messages     ChatMessage[]
+
+  @@unique([organizationId, employeeAId, employeeBId])
+  @@index([organizationId, employeeAId, lastMessageAt])
+  @@index([organizationId, employeeBId, lastMessageAt])
+}
+
+/// A message.
+///
+/// There is no `deletedAt`, no `editedAt` and no delete path anywhere in the
+/// product -- not for the sender, not for an administrator. The only removal is
+/// the thirty-day age-out in `runMaintenanceJobs`. A column here would be the
+/// first step towards somebody adding one.
+model ChatMessage {
+  id             String   @id @default(cuid())
+  organizationId String
+  threadId       String
+  senderId       String
+  body           String   @db.VarChar(2000)
+  createdAt      DateTime @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  thread       ChatThread   @relation(fields: [threadId], references: [id], onDelete: Cascade)
+  sender       Employee     @relation("ChatMessageSender", fields: [senderId], references: [id], onDelete: Cascade)
+
+  @@index([threadId, createdAt])
+  @@index([organizationId, senderId, createdAt])
+}
+
+/// Somebody has blocked somebody.
+///
+/// Silent to the person blocked: they can still send, and it simply does not
+/// arrive. Telling them is what makes blocking dangerous for the person who
+/// needed it.
+model ChatBlock {
+  id             String   @id @default(cuid())
+  organizationId String
+  blockerId      String
+  blockedId      String
+  createdAt      DateTime @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  blocker      Employee     @relation("ChatBlocker", fields: [blockerId], references: [id], onDelete: Cascade)
+  blocked      Employee     @relation("ChatBlocked", fields: [blockedId], references: [id], onDelete: Cascade)
+
+  @@unique([blockerId, blockedId])
+  @@index([organizationId, blockerId])
+}
+
+/// A conversation somebody has reported to their administrators.
+///
+/// The reason and the reporter are kept; the messages are not copied, because
+/// they are already in the thread and duplicating them would leave a second,
+/// unpurged copy of a private conversation somewhere else.
+model ChatReport {
+  id             String    @id @default(cuid())
+  organizationId String
+  threadId       String
+  reporterId     String
+  reason         String    @db.VarChar(1000)
+  reviewedById   String?
+  reviewedAt     DateTime?
+  createdAt      DateTime  @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  reporter     Employee     @relation("ChatReporter", fields: [reporterId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, reviewedAt])
+}
+
+model ReportingRelationship {
+  id             String        @id @default(cuid())
+  organizationId String
+  employeeId     String
+  managerId      String
+  type           ReportingType @default(PRIMARY)
+  startDate      DateTime?     @db.Date
+  endDate        DateTime?     @db.Date
+  createdAt      DateTime      @default(now())
+
+  employee Employee @relation("Subordinate", fields: [employeeId], references: [id], onDelete: Cascade)
+  manager  Employee @relation("Manager", fields: [managerId], references: [id], onDelete: Cascade)
+
+  /// No `@@unique([employeeId, managerId, type])`: re-appointing a previous
+  /// manager has to write a *new* row, or the old span is overwritten and the
+  /// approval they gave last March loses its manager. What must stay unique is
+  /// one *live* PRIMARY line per employee, which Prisma cannot express -- it is
+  /// a partial index created by hand in the migration and named
+  /// `ReportingRelationship_one_live_primary`. `prisma db pull` will not see
+  /// it, so a future `migrate dev` will not recreate it.
+  @@index([organizationId, managerId, endDate])
+  @@index([organizationId, employeeId, endDate])
+}
+
+model EmploymentStateChange {
+  id          String           @id @default(cuid())
+  employeeId  String
+  fromState   EmploymentState?
+  toState     EmploymentState
+  effectiveOn DateTime         @db.Date
+  reason      String?
+  actorId     String?
+  automatic   Boolean          @default(false)
+  createdAt   DateTime         @default(now())
+
+  employee Employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+
+  @@index([employeeId, effectiveOn])
+}
+
+model TrainingPlan {
+  id                   String          @id @default(cuid())
+  organizationId       String
+  employeeId           String
+  startDate            DateTime        @db.Date
+  endDate              DateTime        @db.Date
+  mode                 String // PERCENT | FIXED | UNPAID
+  percent              Decimal?        @db.Decimal(6, 3)
+  fixedAmountPaise     Int?
+  postTrainingState    EmploymentState @default(REGULAR)
+  postTrainingCtcPaise Int?
+  completedAt          DateTime?
+  note                 String?
+  createdAt            DateTime        @default(now())
+
+  employee Employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, endDate])
+  @@index([employeeId])
+}
+
+// ============================================================ ATTENDANCE
+
+model AttendanceDay {
+  id                String           @id @default(cuid())
+  organizationId    String
+  employeeId        String
+  date              DateTime         @db.Date
+  status            AttendanceStatus @default(NOT_MARKED)
+  systemStatus      AttendanceStatus @default(NOT_MARKED)
+  shiftId           String?
+  firstCheckInAt    DateTime?
+  lastCheckOutAt    DateTime?
+  workedMinutes     Int              @default(0)
+  breakMinutes      Int              @default(0)
+  lateMinutes       Int              @default(0)
+  earlyLeaveMinutes Int              @default(0)
+  overtimeMinutes   Int              @default(0)
+  isExtraDay        Boolean          @default(false)
+  leaveRequestId    String?
+  holidayId         String?
+  remarks           String?
+  overriddenById    String?
+  overriddenAt      DateTime?
+  overrideReason    String?
+  source            AttendanceSource @default(SELF_GPS)
+  createdAt         DateTime         @default(now())
+  updatedAt         DateTime         @updatedAt
+
+  organization Organization      @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  employee     Employee          @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  events       AttendanceEvent[]
+
+  @@unique([employeeId, date])
+  @@index([organizationId, date])
+  @@index([organizationId, status, date])
+}
+
+model AttendanceEvent {
+  id               String              @id @default(cuid())
+  organizationId   String
+  employeeId       String
+  attendanceDayId  String?
+  type             AttendanceEventType
+  occurredAt       DateTime
+  latitude         Decimal?            @db.Decimal(10, 7)
+  longitude        Decimal?            @db.Decimal(10, 7)
+  accuracyMeters   Int?
+  distanceMeters   Int?
+  withinGeofence   Boolean             @default(false)
+  workLocationId   String?
+  selfieKey        String?
+  /// Set when the retention job deletes the image; the row itself is kept.
+  selfiePurgedAt   DateTime?
+  /// Face-verification outcome. Score is cosine similarity against the enrolled
+  /// reference; null when matching was off or could not run.
+  faceMatchScore   Decimal?            @db.Decimal(6, 5)
+  faceMatchPassed  Boolean?
+  faceMatchReason  String?
+  /// Raised when the match failed, was skipped, or the photo was unusable.
+  flaggedForReview Boolean             @default(false)
+  reviewedById     String?
+  reviewedAt       DateTime?
+  reviewNote       String?
+  deviceInfo       Json?
+  ipAddress        String?
+  source           AttendanceSource    @default(SELF_GPS)
+  /// Set only on a kiosk mark that skipped the face check. A typed column
+  /// rather than a note, because "how many marks bypassed verification last
+  /// month" is a question an auditor will ask and a free-text field cannot
+  /// answer.
+  kioskBypass      KioskBypass?
+  /// Who authorised the bypass — the manager who issued the PIN, or the
+  /// supervisor who stood at the device.
+  bypassById       String?
+  note             String?
+  createdAt        DateTime            @default(now())
+
+  organization  Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  employee      Employee       @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  attendanceDay AttendanceDay? @relation(fields: [attendanceDayId], references: [id], onDelete: SetNull)
+
+  @@index([organizationId, occurredAt])
+  @@index([employeeId, occurredAt])
+  @@index([organizationId, flaggedForReview])
+}
+
+// ============================================================ LEAVE
+
+model LeaveType {
+  id               String   @id @default(cuid())
+  organizationId   String
+  name             String
+  code             String
+  paid             Boolean  @default(true)
+  annualAllocation Decimal  @default(0) @db.Decimal(6, 2)
+  accrualMode      String   @default("ANNUAL") // ANNUAL | MONTHLY | NONE
+  monthlyAccrual   Decimal  @default(0) @db.Decimal(6, 2)
+  carryForward     Boolean  @default(false)
+  maxCarryForward  Decimal  @default(0) @db.Decimal(6, 2)
+  allowHalfDay     Boolean  @default(true)
+  requiresApproval Boolean  @default(true)
+  maxConsecutive   Int?
+  noticeDays       Int      @default(0)
+  countsAsPresent  Boolean  @default(true)
+  isCompOff        Boolean  @default(false)
+  /// The weekly rest day, taken as a request like any other leave.
+  ///
+  /// A day booked against this type becomes `WEEK_OFF` on the attendance
+  /// record rather than `PAID_LEAVE`, which is what links it to the payroll
+  /// rule that counts rest days and pays for the ones nobody got to take. One
+  /// marker, so leave, attendance and payroll cannot disagree about what a
+  /// rest day is.
+  isWeekOff        Boolean  @default(false)
+  /// The most days of this type one person may take in a calendar month,
+  /// counting pending and approved requests. Null means no monthly cap --
+  /// the annual pool is the only limit. Set for the on-demand week off so a
+  /// bank of rest days cannot be spent eight in one month.
+  maxPerMonth      Int?
+  active           Boolean  @default(true)
+  color            String   @default("#3b82f6")
+  createdAt        DateTime @default(now())
+
+  organization           Organization                 @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  requests               LeaveRequest[]
+  balances               LeaveBalance[]
+  designationAllocations DesignationLeaveAllocation[]
+
+  @@unique([organizationId, code])
+}
+
+model LeaveBalance {
+  id             String   @id @default(cuid())
+  organizationId String
+  employeeId     String
+  leaveTypeId    String
+  year           Int
+  allocated      Decimal  @default(0) @db.Decimal(6, 2)
+  accrued        Decimal  @default(0) @db.Decimal(6, 2)
+  used           Decimal  @default(0) @db.Decimal(6, 2)
+  carriedForward Decimal  @default(0) @db.Decimal(6, 2)
+  encashed       Decimal  @default(0) @db.Decimal(6, 2)
+  updatedAt      DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  employee     Employee     @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  leaveType    LeaveType    @relation(fields: [leaveTypeId], references: [id], onDelete: Cascade)
+
+  @@unique([employeeId, leaveTypeId, year])
+  @@index([organizationId, year])
+}
+
+model LeaveRequest {
+  id             String             @id @default(cuid())
+  organizationId String
+  employeeId     String
+  leaveTypeId    String
+  startDate      DateTime           @db.Date
+  endDate        DateTime           @db.Date
+  startDayPart   LeaveDayPart       @default(FULL)
+  endDayPart     LeaveDayPart       @default(FULL)
+  totalDays      Decimal            @db.Decimal(6, 2)
+  reason         String?
+  status         LeaveRequestStatus @default(PENDING)
+  /// @unreachable-ok announcements have no attachment upload; the body is the whole post
+  attachmentKey  String?
+  createdAt      DateTime           @default(now())
+  updatedAt      DateTime           @updatedAt
+
+  organization Organization    @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  employee     Employee        @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  leaveType    LeaveType       @relation(fields: [leaveTypeId], references: [id], onDelete: Cascade)
+  approvals    LeaveApproval[]
+
+  @@index([organizationId, status])
+  @@index([employeeId, startDate])
+}
+
+model LeaveApproval {
+  id             String         @id @default(cuid())
+  leaveRequestId String
+  approverId     String
+  step           Int            @default(1)
+  status         ApprovalStatus @default(PENDING)
+  note           String?
+  actedAt        DateTime?
+  createdAt      DateTime       @default(now())
+
+  request LeaveRequest @relation(fields: [leaveRequestId], references: [id], onDelete: Cascade)
+
+  @@unique([leaveRequestId, step])
+  @@index([approverId, status])
+}
+
+// ============================================================ SALARY & PAYROLL
+
+model SalaryComponent {
+  id             String        @id @default(cuid())
+  organizationId String
+  code           String
+  name           String
+  kind           ComponentKind @default(EARNING)
+  // { "type": "PERCENT_OF_CTC" | "PERCENT_OF_COMPONENT" | "FIXED" | "BALANCE", ... }
+  calc           Json
+  prorated       Boolean       @default(true)
+  taxable        Boolean       @default(true)
+  showOnSlip     Boolean       @default(true)
+  sortOrder      Int           @default(0)
+  active         Boolean       @default(true)
+  createdAt      DateTime      @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, code])
+}
+
+model SalaryProfile {
+  id              String    @id @default(cuid())
+  organizationId  String
+  employeeId      String
+  ctcMonthlyPaise Int
+  effectiveFrom   DateTime  @db.Date
+  effectiveTo     DateTime? @db.Date
+  structure       Json
+  note            String?
+  createdAt       DateTime  @default(now())
+  createdById     String?
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  employee     Employee     @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+
+  @@index([employeeId, effectiveFrom])
+  @@index([organizationId])
+}
+
+model OrgPolicyVersion {
+  id             String     @id @default(cuid())
+  organizationId String
+  kind           PolicyKind
+  version        Int
+  payload        Json
+  effectiveFrom  DateTime   @db.Date
+  active         Boolean    @default(true)
+  note           String?
+  createdAt      DateTime   @default(now())
+  createdById    String?
+  approvedById   String?
+  approvedAt     DateTime?
+  aiGenerated    Boolean    @default(false)
+  aiPrompt       String?
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, kind, version])
+  @@index([organizationId, kind, effectiveFrom])
+}
+
+model PayrollRun {
+  id             String           @id @default(cuid())
+  organizationId String
+  periodYear     Int
+  periodMonth    Int
+  periodStart    DateTime         @db.Date
+  periodEnd      DateTime         @db.Date
+  status         PayrollRunStatus @default(DRAFT)
+  revision       Int              @default(1)
+  policySnapshot Json?
+  totals         Json?
+  calculatedAt   DateTime?
+  approvedAt     DateTime?
+  approvedById   String?
+  lockedAt       DateTime?
+  lockedById     String?
+  note           String?
+  createdAt      DateTime         @default(now())
+  createdById    String?
+
+  organization   Organization         @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  items          PayrollItem[]
+  adjustments    PayrollAdjustment[]
+  /// Claims this run paid, stamped at lock. See ReimbursementClaim.paidInRunId.
+  reimbursements ReimbursementClaim[]
+
+  @@unique([organizationId, periodYear, periodMonth, revision])
+  @@index([organizationId, periodYear, periodMonth])
+  @@index([organizationId, status])
+}
+
+model PayrollItem {
+  id                    String                  @id @default(cuid())
+  organizationId        String
+  payrollRunId          String
+  employeeId            String
+  ctcMonthlyPaise       Int
+  basisDays             Decimal                 @db.Decimal(6, 2)
+  payableDays           Decimal                 @db.Decimal(6, 2)
+  presentDays           Decimal                 @db.Decimal(6, 2)
+  paidLeaveDays         Decimal                 @db.Decimal(6, 2)
+  unpaidLeaveDays       Decimal                 @db.Decimal(6, 2)
+  halfDays              Decimal                 @db.Decimal(6, 2)
+  absentDays            Decimal                 @db.Decimal(6, 2)
+  weekOffDays           Decimal                 @db.Decimal(6, 2)
+  holidayDays           Decimal                 @db.Decimal(6, 2)
+  extraDays             Decimal                 @db.Decimal(6, 2)
+  lateCount             Int                     @default(0)
+  overtimeMinutes       Int                     @default(0)
+  grossPaise            Int
+  earningsPaise         Int
+  deductionsPaise       Int
+  advanceRecoveredPaise Int                     @default(0)
+  netPaise              Int
+  paidPaise             Int                     @default(0)
+  settlement            PaymentSettlementStatus @default(UNPAID)
+  earnings              Json
+  deductions            Json
+  trace                 Json
+  warnings              String[]                @default([])
+  /// Compensatory-off days this item earned, as the engine computed them.
+  /// Held here rather than recomputed, so the leave credit and the payslip
+  /// can never disagree about what was earned.
+  compOffCredits        Json?
+  /// What the engine decided to recover against each advance this month, kept so
+  /// the write-back at lock uses exactly that rather than re-deriving it from a
+  /// policy that may have changed in between. Same shape and same reasoning as
+  /// `compOffCredits` above.
+  advanceRecoveries     Json?
+  /// Stamped when those recoveries were written back, so unlocking and locking
+  /// again cannot recover the same money twice.
+  advancesAppliedAt     DateTime?
+  /// When those days were added to the leave balance. Set once, at lock, and
+  /// checked before crediting so unlocking and re-locking cannot pay twice.
+  compOffCreditedAt     DateTime?
+  createdAt             DateTime                @default(now())
+  updatedAt             DateTime                @updatedAt
+
+  run      PayrollRun      @relation(fields: [payrollRunId], references: [id], onDelete: Cascade)
+  employee Employee        @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  payments SalaryPayment[]
+  slip     SalarySlip?
+
+  @@unique([payrollRunId, employeeId])
+  @@index([organizationId, settlement])
+  @@index([employeeId])
+}
+
+/// A change an administrator makes to one person's pay for one month.
+///
+/// Attached to the run and the employee rather than to a `PayrollItem`, because
+/// recalculating a run deletes and rebuilds its items — and an adjustment that
+/// cascaded away with them would apply once and then vanish, which is worse than
+/// not applying at all. It is a decision about somebody's pay for a month, not
+/// about a particular calculation of it.
+model PayrollAdjustment {
+  id             String        @id @default(cuid())
+  organizationId String
+  payrollRunId   String
+  employeeId     String
+  code           String
+  label          String
+  kind           ComponentKind
+  amountPaise    Int
+  reason         String?
+  createdById    String?
+  createdAt      DateTime      @default(now())
+
+  run      PayrollRun @relation(fields: [payrollRunId], references: [id], onDelete: Cascade)
+  employee Employee   @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+
+  @@index([payrollRunId, employeeId])
+  @@index([organizationId])
+}
+
+model SalaryPayment {
+  id             String   @id @default(cuid())
+  organizationId String
+  payrollItemId  String
+  amountPaise    Int
+  paidOn         DateTime @db.Date
+  method         String   @default("BANK_TRANSFER")
+  reference      String?
+  remarks        String?
+  createdById    String?
+  createdAt      DateTime @default(now())
+
+  item PayrollItem @relation(fields: [payrollItemId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, paidOn])
+  @@index([payrollItemId])
+}
+
+model SalaryAdvance {
+  id             String        @id @default(cuid())
+  organizationId String
+  employeeId     String
+  amountPaise    Int
+  recoveredPaise Int           @default(0)
+  issuedOn       DateTime      @db.Date
+  // { "mode": "FULL_NEXT" | "INSTALLMENTS" | "PERCENT_OF_NET" | "MANUAL", ... }
+  recovery       Json
+  status         AdvanceStatus @default(ACTIVE)
+  reason         String?
+  approvedById   String?
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  organization Organization           @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  employee     Employee               @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  recoveries   AdvanceRecoveryEntry[]
+
+  @@index([organizationId, status])
+  @@index([employeeId])
+}
+
+model AdvanceRecoveryEntry {
+  id            String   @id @default(cuid())
+  advanceId     String
+  payrollItemId String?
+  amountPaise   Int
+  periodYear    Int
+  periodMonth   Int
+  createdAt     DateTime @default(now())
+
+  advance SalaryAdvance @relation(fields: [advanceId], references: [id], onDelete: Cascade)
+
+  @@unique([advanceId, payrollItemId])
+  @@index([advanceId])
+}
+
+model SalarySlip {
+  id             String   @id @default(cuid())
+  organizationId String
+  payrollItemId  String   @unique
+  slipNumber     String
+  fileKey        String?
+  generatedAt    DateTime @default(now())
+  generatedById  String?
+
+  item PayrollItem @relation(fields: [payrollItemId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, slipNumber])
+}
+
+// ============================================================ DOCUMENTS
+
+model EmployeeDocument {
+  id             String         @id @default(cuid())
+  organizationId String
+  employeeId     String
+  category       String
+  title          String
+  status         DocumentStatus @default(PENDING_VERIFICATION)
+  expiresOn      DateTime?      @db.Date
+  currentVersion Int            @default(1)
+  uploadedById   String?
+  verifiedById   String?
+  verifiedAt     DateTime?
+  note           String?
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+
+  organization     Organization              @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  employee         Employee                  @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  versions         DocumentVersion[]
+  deletionRequests DocumentDeletionRequest[]
+
+  @@index([organizationId, employeeId])
+  @@index([organizationId, status])
+}
+
+model DocumentVersion {
+  id           String   @id @default(cuid())
+  documentId   String
+  version      Int
+  fileKey      String
+  fileName     String
+  mimeType     String
+  sizeBytes    Int
+  checksum     String?
+  uploadedById String?
+  createdAt    DateTime @default(now())
+
+  document EmployeeDocument @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  @@unique([documentId, version])
+}
+
+model DocumentDeletionRequest {
+  id             String         @id @default(cuid())
+  organizationId String
+  documentId     String
+  requestedById  String
+  reason         String?
+  status         ApprovalStatus @default(PENDING)
+  reviewedById   String?
+  reviewedAt     DateTime?
+  reviewNote     String?
+  createdAt      DateTime       @default(now())
+
+  document EmployeeDocument @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, status])
+}
+
+// ============================================================ ANNOUNCEMENTS
+
+model Announcement {
+  id              String    @id @default(cuid())
+  organizationId  String
+  authorId        String
+  title           String
+  body            String
+  /// @unreachable-ok announcements have no attachment upload; the body is the whole post
+  attachmentKey   String?
+  /// @unreachable-ok part of the unbuilt announcement attachment
+  attachmentName  String?
+  // { "scope": "ALL"|"DEPARTMENT"|"ROLE"|"TEAM"|"EMPLOYEES", ... }
+  audience        Json      @default("{\"scope\":\"ALL\"}")
+  pinned          Boolean   @default(false)
+  publishAt       DateTime  @default(now())
+  expiresAt       DateTime?
+  published       Boolean   @default(true)
+  commentsEnabled Boolean   @default(true)
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  organization Organization          @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  author       User                  @relation("AnnouncementAuthor", fields: [authorId], references: [id], onDelete: Cascade)
+  likes        AnnouncementLike[]
+  comments     AnnouncementComment[]
+
+  @@index([organizationId, publishAt])
+}
+
+model AnnouncementLike {
+  id             String   @id @default(cuid())
+  announcementId String
+  userId         String
+  createdAt      DateTime @default(now())
+
+  announcement Announcement @relation(fields: [announcementId], references: [id], onDelete: Cascade)
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([announcementId, userId])
+}
+
+model AnnouncementComment {
+  id             String    @id @default(cuid())
+  announcementId String
+  userId         String
+  parentId       String?
+  body           String
+  deletedAt      DateTime?
+  deletedById    String?
+  createdAt      DateTime  @default(now())
+
+  announcement Announcement          @relation(fields: [announcementId], references: [id], onDelete: Cascade)
+  user         User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  parent       AnnouncementComment?  @relation("CommentThread", fields: [parentId], references: [id], onDelete: Cascade)
+  replies      AnnouncementComment[] @relation("CommentThread")
+
+  @@index([announcementId, createdAt])
+}
+
+// ============================================================ LETTERS & AI
+
+/// An organisation's overrides for one letter category.
+///
+/// `title` and `bodyTemplate` are **nullable, and that is the point**. A row
+/// used to mean "this organisation has its own wording", and both columns were
+/// NOT NULL -- so `setFrameworkSignature`, which has to create a row to hang an
+/// uploaded signature on, filled them by copying the built-in text verbatim.
+/// That froze whatever the defaults said on the day somebody uploaded a
+/// signature, and no later improvement to the shipped wording could ever reach
+/// them again.
+///
+/// Null now means "not overridden, use the built-in", so a row can carry a
+/// signature, or a signatory name, without also taking ownership of the words.
+model LetterTemplate {
+  id             String   @id @default(cuid())
+  organizationId String
+  title          String?
+  category       String
+  bodyTemplate   String?
+  /// Plain text, not HTML. The PDF renderer emits paragraphs and cannot lay out
+  /// markup, so the old `headerHtml`/`footerHtml` names described something the
+  /// product could never render. They were also read by nothing at all.
+  headerText     String?
+  footerText     String?
+  /// All three fall back to the organisation's when null -- see
+  /// `Organization.signatureKey`. A row exists to override, not to repeat.
+  signatoryName  String?
+  signatoryTitle String?
+  signatureKey   String?
+  /// Whether the signature and the stamp are placed on this letter.
+  ///
+  /// Both were unconditional: the signature appeared whenever the template row
+  /// had one and the stamp whenever the organisation had one, with nothing
+  /// anywhere to say "not on this letter". A salary certificate wants both; an
+  /// internal memo often wants neither.
+  showSignature  Boolean  @default(true)
+  showStamp      Boolean  @default(true)
+  showLogo       Boolean  @default(true)
+  placeholders   String[] @default([])
+  active         Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  createdById    String?
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  letters      Letter[]
+
+  /// One framework per letter type. The product offers a default for every
+  /// category and an organisation edits it; two rows for the same category
+  /// would make "restore to default" ambiguous about what it restored.
+  @@unique([organizationId, category])
+  @@unique([organizationId, title])
+}
+
+model Letter {
+  id             String       @id @default(cuid())
+  organizationId String
+  employeeId     String
+  templateId     String?
+  letterNumber   String
+  category       String
+  subject        String
+  body           String
+  status         LetterStatus @default(DRAFT)
+  issuedOn       DateTime?    @db.Date
+  fileKey        String?
+  aiGenerated    Boolean      @default(false)
+  aiPrompt       String?
+  aiModel        String?
+  variables      Json         @default("{}")
+  createdById    String?
+  issuedById     String?
+  revokedAt      DateTime?
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  organization Organization    @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  employee     Employee        @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  template     LetterTemplate? @relation(fields: [templateId], references: [id], onDelete: SetNull)
+
+  @@unique([organizationId, letterNumber])
+  @@index([organizationId, employeeId])
+}
+
+model AiConfig {
+  id                  String    @id @default(cuid())
+  organizationId      String    @unique
+  provider            String    @default("openrouter")
+  apiKeyCipher        String?
+  model               String    @default("z-ai/glm-5.3-flash")
+  letterSystemPrompt  String?
+  payrollSystemPrompt String?
+  temperature         Decimal   @default(0.3) @db.Decimal(3, 2)
+  maxTokens           Int       @default(2048)
+  monthlyTokenCap     Int?
+  tokensUsedThisMonth Int       @default(0)
+  usageResetAt        DateTime?
+  enabled             Boolean   @default(true)
+  /// Whether this organisation's own administrator may set the API key.
+  ///
+  /// Off means Broadmate holds it: the organisation sends the key over and the
+  /// Superadmin pastes it in on their behalf. The key is encrypted either way —
+  /// this only decides who is allowed to put it there.
+  orgMayManageKey     Boolean   @default(true)
+  updatedAt           DateTime  @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+}
+
+// ============================================================ CROSS-CUTTING
+
+model AuditLog {
+  id             String   @id @default(cuid())
+  organizationId String?
+  actorId        String?
+  actorEmail     String?
+  actorRole      String?
+  action         String
+  entityType     String
+  entityId       String?
+  before         Json?
+  after          Json?
+  metadata       Json?
+  ipAddress      String?
+  userAgent      String?
+  createdAt      DateTime @default(now())
+
+  organization Organization? @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  actor        User?         @relation("AuditActor", fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([organizationId, createdAt])
+  @@index([entityType, entityId])
+  @@index([actorId, createdAt])
+}
+
+model Notification {
+  id             String             @id @default(cuid())
+  organizationId String?
+  userId         String
+  type           String
+  title          String
+  body           String?
+  link           String?
+  status         NotificationStatus @default(UNREAD)
+  metadata       Json?
+  createdAt      DateTime           @default(now())
+  readAt         DateTime?
+
+  organization Organization? @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, status, createdAt])
+}
+
+/// Uploaded files, stored in the database rather than on disk.
+///
+/// Everything here is compressed on the way in (see `lib/storage/compress.ts`),
+/// so a selfie is roughly 60–120 KB rather than the 3–6 MB a phone produces.
+/// Keeping them in Postgres means one backup covers the data *and* its files,
+/// and nothing is lost when the app runs on a host with an ephemeral filesystem.
+model FileObject {
+  id             String   @id @default(cuid())
+  /// Opaque, tenant-prefixed path: `org/<orgId>/<kind>/<random>.<ext>`
+  key            String   @unique
+  organizationId String?
+  kind           String
+  mimeType       String
+  sizeBytes      Int
+  checksum       String
+  /// Null when the bytes live elsewhere — the Supabase Storage driver keeps the
+  /// row as an index (retention, orphan sweeps and storage reporting all read
+  /// this table directly) and puts the bytes in a bucket.
+  data           Bytes?
+  createdAt      DateTime @default(now())
+
+  @@index([organizationId, kind])
+  @@index([createdAt])
+}
+
+model RateLimitCounter {
+  id        String   @id
+  count     Int      @default(0)
+  expiresAt DateTime
+
+  @@index([expiresAt])
+}
+
+// ============================================================ FEATURE FLAGS & SEATS
+
+/// Level 1: what the Superadmin allows this organisation to use at all.
+model FeatureGrant {
+  id             String   @id @default(cuid())
+  organizationId String
+  featureKey     String
+  granted        Boolean  @default(true)
+  note           String?
+  grantedById    String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, featureKey])
+  @@index([organizationId])
+}
+
+/// Level 2: what the organisation's own Admin has switched on, within the grant.
+/// A module switched on or off for everybody holding one designation.
+///
+/// The organisation-wide setting says what the company does; this says what a
+/// job does. "Nobody on the shop floor needs the reimbursements screen" is a
+/// statement about a role, and making it one row rather than forty is the
+/// difference between a policy somebody maintains and one they abandon.
+///
+/// Absent means "follow the organisation". There is no third state, because a
+/// row that says "same as the organisation" is a row somebody has to keep in
+/// step by hand.
+/// How many days of one leave type a designation gets.
+///
+/// `LeaveType.annualAllocation` is one number for the whole company, which is
+/// not how leave works anywhere: a manager and a trainee do not get the same
+/// casual leave. This is the per-designation answer, and the type's own number
+/// is what a designation without a row here falls back to.
+///
+/// Still above `LeaveBalance.allocated`, which stays the finest layer -- the
+/// one person whose contract says something different.
+model DesignationLeaveAllocation {
+  id               String   @id @default(cuid())
+  organizationId   String
+  designationId    String
+  leaveTypeId      String
+  /// Days a year. Same units and precision as `LeaveType.annualAllocation`.
+  annualAllocation Decimal  @default(0) @db.Decimal(5, 2)
+  updatedById      String?
+  updatedAt        DateTime @updatedAt
+  createdAt        DateTime @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  designation  Designation  @relation(fields: [designationId], references: [id], onDelete: Cascade)
+  leaveType    LeaveType    @relation(fields: [leaveTypeId], references: [id], onDelete: Cascade)
+
+  @@unique([designationId, leaveTypeId])
+  @@index([organizationId])
+  @@index([leaveTypeId])
+}
+
+model DesignationModuleSetting {
+  id             String   @id @default(cuid())
+  organizationId String
+  designationId  String
+  moduleKey      String
+  enabled        Boolean
+  updatedById    String?
+  updatedAt      DateTime @updatedAt
+  createdAt      DateTime @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  designation  Designation  @relation(fields: [designationId], references: [id], onDelete: Cascade)
+
+  @@unique([designationId, moduleKey])
+  @@index([organizationId])
+}
+
+/// A module switched on or off for one person, whatever their designation says.
+///
+/// The exception the designation does not describe, and the reason both layers
+/// exist: an organisation will always have somebody who is the one person in
+/// their role who needs a thing, or the one who must not have it.
+model UserModuleSetting {
+  id             String   @id @default(cuid())
+  organizationId String
+  userId         String
+  moduleKey      String
+  enabled        Boolean
+  updatedById    String?
+  updatedAt      DateTime @updatedAt
+  createdAt      DateTime @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  user         User         @relation("ModuleSetting", fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, moduleKey])
+  @@index([organizationId])
+}
+
+model OrgModuleSetting {
+  id             String   @id @default(cuid())
+  organizationId String
+  moduleKey      String
+  enabled        Boolean  @default(false)
+  config         Json     @default("{}")
+  updatedById    String?
+  updatedAt      DateTime @updatedAt
+  createdAt      DateTime @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, moduleKey])
+  @@index([organizationId])
+}
+
+/// Daily count of billable (ACTIVE) employees — powers seat history and overage checks.
+model SeatUsageSnapshot {
+  id              String   @id @default(cuid())
+  organizationId  String
+  date            DateTime @db.Date
+  activeEmployees Int
+  seats           Int
+  overage         Int      @default(0)
+  createdAt       DateTime @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, date])
+  @@index([organizationId, date])
+}
+
+// ============================================================ EXIT & FULL-AND-FINAL
+
+model ExitRecord {
+  id                  String     @id @default(cuid())
+  organizationId      String
+  employeeId          String     @unique
+  type                ExitType   @default(RESIGNATION)
+  status              ExitStatus @default(INITIATED)
+  resignationDate     DateTime   @db.Date
+  lastWorkingDay      DateTime   @db.Date
+  noticeDaysRequired  Int        @default(0)
+  noticeDaysServed    Int        @default(0)
+  /// Shortfall days recovered from the final settlement.
+  noticeShortfallDays Int        @default(0)
+  reason              String?
+  exitInterviewNote   String?
+  /// @unreachable-ok never asked at exit and never shown; rehire is a conversation, not a flag
+  rehireEligible      Boolean    @default(true)
+  createdById         String?
+  createdAt           DateTime   @default(now())
+  updatedAt           DateTime   @updatedAt
+
+  organization Organization        @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  employee     Employee            @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  checklist    ExitChecklistItem[]
+  settlement   FnfSettlement?
+
+  @@index([organizationId, status])
+  @@index([organizationId, lastWorkingDay])
+}
+
+model ExitChecklistItem {
+  id            String     @id @default(cuid())
+  exitRecordId  String
+  title         String
+  description   String?
+  ownerUserId   String?
+  status        TaskStatus @default(PENDING)
+  dueOn         DateTime?  @db.Date
+  completedAt   DateTime?
+  completedById String?
+  note          String?
+  sortOrder     Int        @default(0)
+  createdAt     DateTime   @default(now())
+
+  exitRecord ExitRecord @relation(fields: [exitRecordId], references: [id], onDelete: Cascade)
+
+  @@index([exitRecordId, status])
+}
+
+model FnfSettlement {
+  id              String    @id @default(cuid())
+  organizationId  String
+  employeeId      String
+  exitRecordId    String?   @unique
+  status          FnfStatus @default(DRAFT)
+  /// Frozen inputs + policy so a settled F&F never moves when settings change.
+  snapshot        Json?
+  earningsPaise   Int       @default(0)
+  deductionsPaise Int       @default(0)
+  netPaise        Int       @default(0)
+  paidPaise       Int       @default(0)
+  computedAt      DateTime?
+  approvedById    String?
+  approvedAt      DateTime?
+  settledOn       DateTime? @db.Date
+  fileKey         String?
+  note            String?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  employee     Employee     @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  exitRecord   ExitRecord?  @relation(fields: [exitRecordId], references: [id], onDelete: SetNull)
+  lines        FnfLine[]
+
+  @@index([organizationId, status])
+  @@index([employeeId])
+}
+
+model FnfLine {
+  id           String        @id @default(cuid())
+  settlementId String
+  code         String
+  label        String
+  kind         ComponentKind
+  amountPaise  Int
+  formula      String?
+  sortOrder    Int           @default(0)
+
+  settlement FnfSettlement @relation(fields: [settlementId], references: [id], onDelete: Cascade)
+
+  @@index([settlementId])
+}
+
+// ============================================================ REIMBURSEMENTS
+
+model ReimbursementClaim {
+  id             String      @id @default(cuid())
+  organizationId String
+  employeeId     String
+  claimNumber    String
+  title          String
+  status         ClaimStatus @default(DRAFT)
+  totalPaise     Int         @default(0)
+  approvedPaise  Int         @default(0)
+  /// Payroll period the approved amount is paid in.
+  periodYear     Int?
+  periodMonth    Int?
+  /// The run that paid it, stamped when that run is locked. Deliberately the
+  /// run and not the payroll *item*: recalculating a run deletes and rebuilds
+  /// its items, so a marker hanging off an item is erased by the next
+  /// calculation — the same defect that had to be fixed for PayrollAdjustment.
+  paidInRunId    String?
+  paidAt         DateTime?
+  submittedAt    DateTime?
+  reviewedById   String?
+  reviewedAt     DateTime?
+  reviewNote     String?
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+
+  organization Organization        @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  employee     Employee            @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  paidInRun    PayrollRun?         @relation(fields: [paidInRunId], references: [id], onDelete: SetNull)
+  items        ReimbursementItem[]
+
+  @@unique([organizationId, claimNumber])
+  @@index([organizationId, status])
+  @@index([employeeId])
+}
+
+model ReimbursementItem {
+  id          String   @id @default(cuid())
+  claimId     String
+  category    String
+  description String?
+  spentOn     DateTime @db.Date
+  amountPaise Int
+  fileKey     String?
+  fileName    String?
+  createdAt   DateTime @default(now())
+
+  claim ReimbursementClaim @relation(fields: [claimId], references: [id], onDelete: Cascade)
+
+  @@index([claimId])
+}
+
+// ============================================================ ONBOARDING & ASSETS
+
+model OnboardingTemplate {
+  id             String   @id @default(cuid())
+  organizationId String
+  name           String
+  description    String?
+  active         Boolean  @default(true)
+  createdAt      DateTime @default(now())
+
+  organization Organization             @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  tasks        OnboardingTemplateTask[]
+  issued       OnboardingTask[]
+
+  @@unique([organizationId, name])
+}
+
+model OnboardingTemplateTask {
+  id            String      @id @default(cuid())
+  templateId    String
+  title         String
+  description   String?
+  /// Which role is expected to complete it; the actual owner is set on issue.
+  ownerRole     SystemRole?
+  dueOffsetDays Int         @default(0)
+  sortOrder     Int         @default(0)
+
+  template OnboardingTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
+
+  @@index([templateId])
+}
+
+model OnboardingTask {
+  id             String     @id @default(cuid())
+  organizationId String
+  employeeId     String
+  templateId     String?
+  title          String
+  description    String?
+  ownerUserId    String?
+  dueOn          DateTime?  @db.Date
+  status         TaskStatus @default(PENDING)
+  completedAt    DateTime?
+  completedById  String?
+  note           String?
+  sortOrder      Int        @default(0)
+  createdAt      DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
+
+  organization Organization        @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  employee     Employee            @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  template     OnboardingTemplate? @relation(fields: [templateId], references: [id], onDelete: SetNull)
+
+  @@index([organizationId, status])
+  @@index([employeeId])
+}
+
+model Asset {
+  id             String      @id @default(cuid())
+  organizationId String
+  assetTag       String
+  name           String
+  category       String
+  serialNumber   String?
+  /// @unreachable-ok assets are tracked by who holds them, not by when they were bought
+  purchaseDate   DateTime?   @db.Date
+  valuePaise     Int?
+  status         AssetStatus @default(AVAILABLE)
+  note           String?
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+
+  organization Organization      @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  assignments  AssetAssignment[]
+
+  @@unique([organizationId, assetTag])
+  @@index([organizationId, status])
+}
+
+model AssetAssignment {
+  id                String    @id @default(cuid())
+  organizationId    String
+  assetId           String
+  employeeId        String
+  issuedOn          DateTime  @db.Date
+  dueOn             DateTime? @db.Date
+  returnedOn        DateTime? @db.Date
+  conditionOnIssue  String?
+  conditionOnReturn String?
+  acknowledgedAt    DateTime?
+  /// Charged back through the final settlement when an asset is not returned.
+  recoveryPaise     Int?
+  note              String?
+  createdById       String?
+  createdAt         DateTime  @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  asset        Asset        @relation(fields: [assetId], references: [id], onDelete: Cascade)
+  employee     Employee     @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, employeeId])
+  @@index([assetId])
+}
+
+// ============================================================ PERFORMANCE
+
+model ReviewCycle {
+  id               String            @id @default(cuid())
+  organizationId   String
+  name             String
+  startDate        DateTime          @db.Date
+  endDate          DateTime          @db.Date
+  /// @unreachable-ok a cycle has one window; neither due date is set or shown
+  selfReviewDue    DateTime?         @db.Date
+  /// @unreachable-ok as above -- declared with the model and never wired to anything
+  managerReviewDue DateTime?         @db.Date
+  status           ReviewCycleStatus @default(DRAFT)
+  /// Competency list evaluated in this cycle: [{ code, label, weight }]
+  competencies     Json              @default("[]")
+  createdAt        DateTime          @default(now())
+
+  organization Organization        @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  reviews      PerformanceReview[]
+  goals        Goal[]
+
+  @@unique([organizationId, name])
+  @@index([organizationId, status])
+}
+
+model Goal {
+  id             String     @id @default(cuid())
+  organizationId String
+  employeeId     String
+  cycleId        String?
+  title          String
+  description    String?
+  weight         Decimal    @default(1) @db.Decimal(5, 2)
+  /// The target and progress as free text, from before either was a number.
+  ///
+  /// Kept rather than migrated. Every goal in production has both null, and the
+  /// three that exist say what they are worth in their title -- "Sales 1 lakh".
+  /// A text goal keeps working and shows a status; one with a number shows how
+  /// far along it is.
+  targetValue    String?
+  currentValue   String?
+  /// What the numbers below are measured in, when there are numbers.
+  ///
+  /// The same vocabulary Employee of the Month already uses, deliberately: a
+  /// second unit list would be a second place to add "hours" to.
+  unit           RecognitionUnit?
+  targetNumber   Decimal?   @db.Decimal(14, 2)
+  /// Where the goal has got to. Written only by a `GoalProgress` entry, so the
+  /// figure on the goal and the trail behind it cannot disagree.
+  currentNumber  Decimal?   @db.Decimal(14, 2)
+  status         GoalStatus @default(DRAFT)
+  dueOn          DateTime?  @db.Date
+  createdById    String?
+  createdAt      DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  employee     Employee     @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  cycle        ReviewCycle?   @relation(fields: [cycleId], references: [id], onDelete: SetNull)
+  progress     GoalProgress[]
+
+  @@index([organizationId, status])
+  @@index([employeeId])
+}
+
+/// One update to how far along a goal is.
+///
+/// A log rather than a column, because "kitna hua" is asked repeatedly and the
+/// answer people actually want is the shape of it -- was it flat for a month
+/// and then jumped, or steady. Overwriting a single number throws that away
+/// every time it is asked.
+///
+/// The assignee writes these and nothing else: the title, the target and the
+/// unit stay read-only to them, which is the whole distinction between being
+/// given a goal and setting one.
+model GoalProgress {
+  id             String   @id @default(cuid())
+  organizationId String
+  goalId         String
+  /// The running total, not the increment. "Sales are at 60,000 now" is what
+  /// somebody types; how much that was up by is arithmetic anybody can do.
+  value          Decimal  @db.Decimal(14, 2)
+  note           String?
+  createdById    String?
+  createdAt      DateTime @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  goal         Goal         @relation(fields: [goalId], references: [id], onDelete: Cascade)
+
+  @@index([goalId, createdAt])
+  @@index([organizationId])
+}
+
+model PerformanceReview {
+  id             String       @id @default(cuid())
+  organizationId String
+  cycleId        String
+  employeeId     String
+  reviewerId     String
+  status         ReviewStatus @default(NOT_STARTED)
+  selfComment    String?
+  managerComment String?
+  selfRating     Decimal?     @db.Decimal(4, 2)
+  managerRating  Decimal?     @db.Decimal(4, 2)
+  finalRating    Decimal?     @db.Decimal(4, 2)
+  submittedAt    DateTime?
+  completedAt    DateTime?
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  organization Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  cycle        ReviewCycle    @relation(fields: [cycleId], references: [id], onDelete: Cascade)
+  employee     Employee       @relation("ReviewSubject", fields: [employeeId], references: [id], onDelete: Cascade)
+  reviewer     Employee       @relation("ReviewReviewer", fields: [reviewerId], references: [id], onDelete: Cascade)
+  ratings      ReviewRating[]
+
+  @@unique([cycleId, employeeId])
+  @@index([organizationId, status])
+  @@index([reviewerId, status])
+}
+
+model ReviewRating {
+  id           String   @id @default(cuid())
+  reviewId     String
+  competency   String
+  selfScore    Decimal? @db.Decimal(4, 2)
+  managerScore Decimal? @db.Decimal(4, 2)
+  comment      String?
+
+  review PerformanceReview @relation(fields: [reviewId], references: [id], onDelete: Cascade)
+
+  @@unique([reviewId, competency])
+}
+
+// ============================================================ ATTENDANCE REGULARISATION
+
+/// Employee-side remedy for a missed or wrong punch. Admin override still exists,
+/// but an employee should not need an admin to fix their own forgotten check-out.
+model AttendanceRegularisation {
+  id                String               @id @default(cuid())
+  organizationId    String
+  employeeId        String
+  date              DateTime             @db.Date
+  requestedStatus   AttendanceStatus
+  requestedCheckIn  DateTime?
+  requestedCheckOut DateTime?
+  reason            String
+  status            RegularisationStatus @default(PENDING)
+  reviewedById      String?
+  reviewedAt        DateTime?
+  reviewNote        String?
+  createdAt         DateTime             @default(now())
+  updatedAt         DateTime             @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  employee     Employee     @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+
+  @@unique([employeeId, date])
+  @@index([organizationId, status])
+}
+
+// ============================================================ SECURITY & PUSH
+
+model PushSubscription {
+  id         String    @id @default(cuid())
+  userId     String
+  endpoint   String    @unique
+  /// @unreachable-ok web push was never built; nothing subscribes and nothing sends
+  p256dh     String
+  auth       String
+  userAgent  String?
+  /// @unreachable-ok part of the unbuilt web push model
+  lastUsedAt DateTime?
+  /// @unreachable-ok part of the unbuilt web push model
+  failCount  Int       @default(0)
+  createdAt  DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model LoginEvent {
+  id             String   @id @default(cuid())
+  userId         String?
+  organizationId String?
+  email          String
+  success        Boolean
+  /// BAD_PASSWORD | LOCKED | SUSPENDED | NO_SUCH_USER | BAD_TOTP | OK
+  reason         String?
+  ipAddress      String?
+  userAgent      String?
+  deviceLabel    String?
+  createdAt      DateTime @default(now())
+
+  user         User?         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organization Organization? @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@index([email, createdAt])
+}
+
+model DataExportJob {
+  id             String       @id @default(cuid())
+  organizationId String?
+  requestedById  String
+  /// PLATFORM | ORGANIZATION | EMPLOYEE
+  scope          String
+  targetId       String?
+  status         ExportStatus @default(QUEUED)
+  fileKey        String?
+  sizeBytes      Int?
+  /// Shown once so the requester can open the encrypted archive.
+  passwordCipher String?
+  error          String?
+  expiresAt      DateTime?
+  completedAt    DateTime?
+  createdAt      DateTime     @default(now())
+
+  organization Organization? @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, status])
+  @@index([requestedById, createdAt])
+}
+
+/// A thing an organisation measures people on for Employee of the Month.
+///
+/// Kept deliberately small — five at most, three suggested. Past a handful,
+/// nobody can explain to somebody why they did not win, and a recognition
+/// scheme that cannot be explained stops being recognition.
+model RecognitionParameter {
+  id             String               @id @default(cuid())
+  organizationId String
+  name           String
+  /// What the number means. RUPEES is entered in rupees and shown as money.
+  unit           RecognitionUnit      @default(COUNT)
+  /// Whether more is better. Shrinkage, escalations and absence are all the
+  /// other way round, and a scheme that cannot say so is useless to half the
+  /// organisations that would use it.
+  direction      RecognitionDirection @default(HIGHER_IS_BETTER)
+  /// Share of the final score, 0-100. The active parameters must total 100.
+  weight         Int                  @default(0)
+  /// MANUAL is typed in monthly; the rest are computed from data already held.
+  source         RecognitionSource    @default(MANUAL)
+  active         Boolean              @default(true)
+  createdAt      DateTime             @default(now())
+  updatedAt      DateTime             @updatedAt
+
+  organization Organization       @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  scores       RecognitionScore[]
+
+  @@unique([organizationId, name])
+  @@index([organizationId, active])
+}
+
+/// One month's run of the award.
+model RecognitionCycle {
+  id             String            @id @default(cuid())
+  organizationId String
+  periodYear     Int
+  periodMonth    Int
+  status         RecognitionStatus @default(DRAFT)
+  publishedAt    DateTime?
+  publishedById  String?
+  /// What the announcement said, written by a person or drafted by AI.
+  citation       String?
+  createdAt      DateTime          @default(now())
+  updatedAt      DateTime          @updatedAt
+
+  organization Organization       @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  scores       RecognitionScore[]
+  awards       RecognitionAward[]
+
+  @@unique([organizationId, periodYear, periodMonth])
+  @@index([organizationId, status])
+}
+
+/// One employee's figure on one parameter for one month, raw and normalised.
+///
+/// Both are stored because the raw value is what somebody disputes and the
+/// normalised one is what produced the ranking. Recomputing the second from the
+/// first later would give a different answer once the cohort has changed.
+model RecognitionScore {
+  id          String  @id @default(cuid())
+  cycleId     String
+  employeeId  String
+  parameterId String
+  /// Deliberately not integer paise, unlike every other number in this product:
+  /// the same column also holds percentages, counts and hours, and this is a
+  /// metric that is never paid out.
+  rawValue    Decimal @db.Decimal(18, 4)
+  /// 0-1 within the cohort for this month, direction already applied.
+  normalised  Decimal @db.Decimal(6, 5)
+
+  cycle     RecognitionCycle     @relation(fields: [cycleId], references: [id], onDelete: Cascade)
+  employee  Employee             @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  parameter RecognitionParameter @relation(fields: [parameterId], references: [id], onDelete: Cascade)
+
+  @@unique([cycleId, employeeId, parameterId])
+  @@index([cycleId, employeeId])
+}
+
+/// The result, once it has been published.
+model RecognitionAward {
+  id             String   @id @default(cuid())
+  organizationId String
+  cycleId        String
+  employeeId     String
+  rank           Int
+  totalScore     Decimal  @db.Decimal(6, 2)
+  /// Set when an administrator chose somebody other than the top score, with
+  /// the reason. Shown on the award, because an unexplained override is worse
+  /// than no override.
+  overriddenById String?
+  overrideReason String?
+  createdAt      DateTime @default(now())
+
+  organization Organization     @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  cycle        RecognitionCycle @relation(fields: [cycleId], references: [id], onDelete: Cascade)
+  employee     Employee         @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+
+  @@unique([cycleId, rank])
+  @@index([organizationId, employeeId])
+}
+
+enum RecognitionUnit {
+  RUPEES
+  COUNT
+  PERCENT
+  HOURS
+  POINTS
+}
+
+enum RecognitionDirection {
+  HIGHER_IS_BETTER
+  LOWER_IS_BETTER
+}
+
+enum RecognitionSource {
+  MANUAL
+  PRESENT_DAYS
+  PUNCTUALITY
+  OVERTIME_HOURS
+  GOALS_COMPLETED
+}
+
+enum RecognitionStatus {
+  DRAFT
+  PUBLISHED
+  CANCELLED
+}

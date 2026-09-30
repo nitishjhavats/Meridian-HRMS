@@ -1,0 +1,24 @@
+# Keep the build context small and keep secrets out of it entirely.
+node_modules
+.next
+.git
+.github
+.claude
+
+# Never copy a local environment file into an image.
+.env
+.env.*
+!.env.example
+
+# Downloaded in the build stage, not shipped in the context (38 MB).
+models
+
+# Local file-storage driver output.
+storage
+
+# Local-only
+docker-compose.yml
+coverage
+*.tsbuildinfo
+next-env.d.ts
+npm-debug.log*

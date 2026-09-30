@@ -1,0 +1,39 @@
+# The marketing page is public and indexable. Everything behind a login is not.
+#
+# `/o/` in particular: those pages carry a named customer's logo and name, and
+# publishing which companies an operator serves is not the operator's to do. Belt and braces
+# alongside the per-layout `robots` metadata and the X-Robots-Tag header in
+# next.config.mjs, which is narrowed to the same paths.
+User-agent: *
+Allow: /$
+Disallow: /o/
+Disallow: /api/
+Disallow: /login
+Disallow: /change-password
+Disallow: /forgot-password
+Disallow: /dashboard
+Disallow: /employees
+Disallow: /attendance
+Disallow: /leave
+Disallow: /payroll
+Disallow: /reimbursements
+Disallow: /documents
+Disallow: /letters
+Disallow: /announcements
+Disallow: /notifications
+Disallow: /reports
+Disallow: /onboarding
+Disallow: /assets
+Disallow: /performance
+Disallow: /exit
+Disallow: /audit
+Disallow: /billing
+Disallow: /settings
+Disallow: /account
+Disallow: /me/
+Disallow: /platform
+Disallow: /kiosk
+Disallow: /offline
+
+# Set your own origin here (must be absolute):
+# Sitemap: https://YOUR-DOMAIN/sitemap.xml
