@@ -38,6 +38,13 @@ const TODAY = "2026-09-03";
 const CURRENT_YEAR = 2026;
 const PAYROLL_MONTH = 8; // August 2026 — the last completed month
 
+/**
+ * The payee on the seeded platform and its demo orders. Set PAYMENT_UPI_ID to
+ * put a real one in; otherwise it is a handle no UPI app will pay, never a
+ * person's own account.
+ */
+const SEED_PAYEE = process.env.PAYMENT_UPI_ID?.trim() || "payee@example";
+
 const rupees = (n: number) => n * 100;
 
 /**
@@ -116,6 +123,21 @@ async function reset() {
 
 // ------------------------------------------------------------------ platform
 
+/**
+ * The superadmin's password comes from SUPERADMIN_PASSWORD and nowhere else.
+ * There used to be a fallback, published in the README; a database seeded
+ * without setting one got a superadmin anybody could sign in as.
+ */
+function superadminPassword(): string {
+  const password = process.env.SUPERADMIN_PASSWORD?.trim();
+  if (!password) {
+    throw new Error(
+      "Refusing to seed: set SUPERADMIN_PASSWORD to a strong password first. The seed no longer invents one.",
+    );
+  }
+  return password;
+}
+
 async function seedPlatform() {
   console.log("  platform settings + superadmin…");
 
@@ -124,7 +146,7 @@ async function seedPlatform() {
       id: "singleton",
       pricePerUserPaise: rupees(59),
       billingPeriod: "MONTHLY",
-      paymentUpiId: "8434232412@ptyes",
+      paymentUpiId: SEED_PAYEE,
       paymentPayeeName: "HRMS Platform",
       paymentWindowMinutes: 240,
       confirmationMode: "BOTH",
@@ -139,7 +161,7 @@ async function seedPlatform() {
     data: {
       email: process.env.SUPERADMIN_EMAIL ?? "superadmin@hrms.local",
       name: "Platform Owner",
-      passwordHash: await hashPassword(process.env.SUPERADMIN_PASSWORD ?? "ChangeMe@12345"),
+      passwordHash: await hashPassword(superadminPassword()),
       role: "SUPERADMIN",
       status: "ACTIVE",
       passwordChangedAt: new Date(),
@@ -1212,7 +1234,7 @@ async function seedBilling(orgs: { id: string; name: string; seats: number }[], 
       couponId: coupons[0]!.id,
       couponCode: "LAUNCH10",
       status: "APPROVED",
-      upiId: "8434232412@ptyes",
+      upiId: SEED_PAYEE,
       periodMonths: 12,
       confirmationCode: "UTR884512339",
       transactionRef: "UTR884512339",
@@ -1267,7 +1289,7 @@ async function seedBilling(orgs: { id: string; name: string; seats: number }[], 
       discountPaise: 0,
       payablePaise: pendingQuote.payablePaise,
       status: "AWAITING_CONFIRMATION",
-      upiId: "8434232412@ptyes",
+      upiId: SEED_PAYEE,
       periodMonths: 12,
       confirmationCode: "UTR552091447",
       transactionRef: "UTR552091447",
@@ -1297,7 +1319,7 @@ async function seedBilling(orgs: { id: string; name: string; seats: number }[], 
       discountPaise: 0,
       payablePaise: expiredQuote.payablePaise,
       status: "EXPIRED",
-      upiId: "8434232412@ptyes",
+      upiId: SEED_PAYEE,
       periodMonths: 12,
       expiresAt: minutesFromNow(-60 * 24 * 6),
       windowMinutes: 240,
@@ -1318,7 +1340,7 @@ async function seedBilling(orgs: { id: string; name: string; seats: number }[], 
       discountPaise: 0,
       payablePaise: codeQuote.payablePaise,
       status: "INITIATED",
-      upiId: "8434232412@ptyes",
+      upiId: SEED_PAYEE,
       periodMonths: 12,
       issuedCodeHash: code.hash,
       issuedCodeCipher: encryptField(code.plaintext),
@@ -1357,6 +1379,8 @@ async function seedBilling(orgs: { id: string; name: string; seats: number }[], 
 
 async function main() {
   console.log("\nSeeding HRMS demo data\n");
+  // Checked before the truncate, so a missing password costs nothing.
+  superadminPassword();
   await reset();
 
   const superadmin = await seedPlatform();
@@ -1401,10 +1425,9 @@ async function main() {
   // useless outside a seeded database. The Superadmin password is not: when it
   // has been set deliberately, printing it would put a real credential into
   // whatever captured this output — a CI log, a deployment log, a scrollback.
-  const superadminPassword = process.env.SUPERADMIN_PASSWORD;
   console.log(
     `    Superadmin   ${process.env.SUPERADMIN_EMAIL ?? "superadmin@hrms.local"} / ` +
-      (superadminPassword ? "(the SUPERADMIN_PASSWORD you set)" : "ChangeMe@12345"),
+      "(the SUPERADMIN_PASSWORD you set)",
   );
   console.log("    Owner        rajesh.verma@acme.com / Password@123");
   console.log("    Admin        priya.sharma@acme.com / Password@123");

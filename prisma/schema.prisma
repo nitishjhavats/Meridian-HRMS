@@ -486,7 +486,7 @@ model PlatformSetting {
   /// The organisation prefix answers "whose employee is this"; this one
   /// answers "who issued this invoice", and the issuer is always the platform.
   invoicePrefix        String           @default("BMG") @db.VarChar(4)
-  paymentUpiId         String           @default("8434232412@ptyes")
+  paymentUpiId         String           @default("")
   paymentPayeeName     String           @default("HRMS Platform")
   /// Platform-wide logo. Falls back to the built-in mark when unset, and is
   /// what the PWA icons are generated from.

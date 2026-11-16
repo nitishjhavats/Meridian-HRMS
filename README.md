@@ -38,16 +38,13 @@ node -e "console.log('AUTH_SECRET='+require('crypto').randomBytes(48).toString('
 node -e "console.log('PLATFORM_ENCRYPTION_KEY='+require('crypto').randomBytes(32).toString('base64url'))"
 ```
 
-### Demo logins
+### Demo data
 
-| Role | Email | Password |
-|---|---|---|
-| Superadmin | `superadmin@hrms.local` | `ChangeMe@12345` |
-| Organisation Owner | `rajesh.verma@acme.com` | `Password@123` |
-| Admin | `priya.sharma@acme.com` | `Password@123` |
-| HR Manager | `anita.desai@acme.com` | `Password@123` |
-| Team Lead | `vikram.singh@acme.com` | `Password@123` |
-| Team Member | `sneha.patil@acme.com` | `Password@123` |
+`npm run db:seed` (development only: it truncates the target schema first) creates
+demo organisations with one user for every role. Set `SUPERADMIN_PASSWORD` before
+running it; the seed refuses to invent one. The demo sign-ins are printed at the end
+of a local seed run and are deliberately not listed here. Never run the seed against
+a production database.
 
 A second organisation (`bright-retail`) is seeded on a trial with the optional
 modules switched off, so the feature-flag behaviour is visible immediately.

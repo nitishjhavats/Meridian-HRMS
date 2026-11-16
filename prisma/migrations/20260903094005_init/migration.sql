@@ -124,7 +124,7 @@ CREATE TABLE "PlatformSetting" (
     "pricePerUserPaise" INTEGER NOT NULL DEFAULT 5900,
     "currency" TEXT NOT NULL DEFAULT 'INR',
     "billingPeriod" TEXT NOT NULL DEFAULT 'MONTHLY',
-    "paymentUpiId" TEXT NOT NULL DEFAULT '8434232412@ptyes',
+    "paymentUpiId" TEXT NOT NULL DEFAULT '',
     "paymentPayeeName" TEXT NOT NULL DEFAULT 'HRMS Platform',
     "paymentWindowMinutes" INTEGER NOT NULL DEFAULT 240,
     "confirmationMode" "ConfirmationMode" NOT NULL DEFAULT 'BOTH',

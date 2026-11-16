@@ -93,7 +93,10 @@ async function main() {
   const issued = await issueConfirmationCode(platform, orderC.id);
   const confirmedC = await submitConfirmationCode(org, orderC.id, issued.code);
   assert(confirmedC.status === "APPROVED", "the order is approved on entry");
-  assert(confirmedC.reviewedById === superadmin.id, "recorded as the issuer's approval");
+  // The organisation's response no longer says who reviewed it; the row does.
+  const rowC = await prisma.paymentOrder.findUnique({ where: { id: orderC.id } });
+  assert(rowC?.reviewedById === superadmin.id, "recorded as the issuer's approval");
+  assert(!("issuedCodeHash" in confirmedC), "the response carries no code hash");
   const after = await prisma.subscription.findUnique({ where: { organizationId: orgId } });
   assert((after?.seats ?? 0) === (before?.seats ?? 0) + 2, "seats are credited");
   const history = await prisma.subscriptionHistory.findFirst({ where: { paymentOrderId: orderC.id } });

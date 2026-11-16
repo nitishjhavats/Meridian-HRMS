@@ -2,7 +2,8 @@
 
 ## Pricing
 `PlatformSetting.pricePerUserPaise` (default **5900** = ₹59) and
-`PlatformSetting.paymentUpiId` (default `8434232412@ptyes`) are stored in the DB and
+`PlatformSetting.paymentUpiId` (no default: set it in Platform → Settings, or `PAYMENT_UPI_ID`
+before the settings row exists; an unset payee makes order creation refuse) are stored in the DB and
 edited by Superadmin. **No price literal exists anywhere else in the codebase.**
 
 `amount = userCount × pricePerUser` → `discount = round(amount × coupon.percent / 100)`
@@ -39,8 +40,17 @@ client-submitted amount is ignored.
   organisation has confirmed, the clock stops -- a late review still approves.
 * Transitions are the only way to mutate an order (`services/billing/orderMachine.ts`);
   every transition writes an `AuditLog` row and a `SubscriptionHistory` row on approval.
-* Approval is idempotent: keyed on `(orderId, targetState)`; a double-click cannot
-  double-credit seats.
+* Every write to a payment order is a compare-and-set on the `status` and `updatedAt`
+  it was decided on (`writeOrderIfUnchanged`, `src/services/billing/orderWrite.ts`):
+  the approval claim, the organisation's submissions, expiry, reject, request-info and
+  code issue. A second approval (double-click, two superadmins, the issued code typed
+  in two tabs) updates nothing and credits nothing; a stale reject, request-info or
+  resubmission cannot reopen an approved order; the loser gets "changed, reload"
+  (`approvalRace.test.ts`, `orderWriteRace.test.ts`).
+* An organisation's billing endpoints and pages get a `CustomerOrder`
+  (`src/services/billing/customerOrder.ts`), built field by field: never the issued
+  code's hash or cipher, who issued or reviewed it, or the internal ids
+  (`src/services/billing/customerOrder.test.ts`).
 
 ## Coupons
 ```ts

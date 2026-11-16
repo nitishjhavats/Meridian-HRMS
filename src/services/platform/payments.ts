@@ -17,6 +17,7 @@ import {
 } from "@/domain/billing/orderMachine";
 import { getPlatformPricing } from "../billing/orders";
 import { settleApproval } from "../billing/approval";
+import { ORDER_CHANGED_MESSAGE, writeOrderIfUnchanged } from "../billing/orderWrite";
 import { randomNumericCode, sha256 } from "@/lib/crypto/field";
 
 /**
@@ -222,17 +223,17 @@ export async function rejectOrder(
   );
   if (!result.ok) throw new ConflictError(result.message ?? "This request cannot be rejected now.");
 
-  const updated = await prisma.paymentOrder.update({
-    where: { id: order.id },
-    data: {
-      status: "REJECTED",
-      reviewedAt: now,
-      reviewedById: ctx.userId,
-      reviewNote: note,
-      issuedCodeHash: null,
-      issuedCodeCipher: null,
-    },
+  // Onto the row that was read, or not at all: a reject decided on a stale
+  // read must not turn an order approved a moment ago into REJECTED.
+  const updated = await writeOrderIfUnchanged(order, {
+    status: "REJECTED",
+    reviewedAt: now,
+    reviewedById: ctx.userId,
+    reviewNote: note,
+    issuedCodeHash: null,
+    issuedCodeCipher: null,
   });
+  if (!updated) throw new ConflictError(ORDER_CHANGED_MESSAGE);
 
   await prisma.paymentOrderEvent.create({
     data: {
@@ -282,10 +283,11 @@ export async function requestMoreInfo(
   );
   if (!result.ok) throw new ConflictError(result.message ?? "That is not possible now.");
 
-  const updated = await prisma.paymentOrder.update({
-    where: { id: order.id },
-    data: { status: "INFO_REQUESTED", infoRequestNote: note },
-  });
+  // A stale "ask for more information" used to reopen an approved order, and
+  // the organisation's next resubmission let it be approved -- and credited --
+  // a second time.
+  const updated = await writeOrderIfUnchanged(order, { status: "INFO_REQUESTED", infoRequestNote: note });
+  if (!updated) throw new ConflictError(ORDER_CHANGED_MESSAGE);
 
   await prisma.paymentOrderEvent.create({
     data: {
@@ -348,16 +350,14 @@ export async function issueConfirmationCode(
 
   const generated = await generateConfirmationCode();
 
-  const updated = await prisma.paymentOrder.update({
-    where: { id: order.id },
-    data: {
-      issuedCodeHash: generated.hash,
-      issuedCodeCipher: encryptField(generated.plaintext),
-      codeIssuedAt: now,
-      codeIssuedById: ctx.userId,
-      codeAttemptCount: 0,
-    },
+  const updated = await writeOrderIfUnchanged(order, {
+    issuedCodeHash: generated.hash,
+    issuedCodeCipher: encryptField(generated.plaintext),
+    codeIssuedAt: now,
+    codeIssuedById: ctx.userId,
+    codeAttemptCount: 0,
   });
+  if (!updated) throw new ConflictError(ORDER_CHANGED_MESSAGE);
 
   await prisma.paymentOrderEvent.create({
     data: {
