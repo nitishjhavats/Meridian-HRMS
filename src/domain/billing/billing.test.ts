@@ -81,12 +81,12 @@ describe("pricing", () => {
 
   it("builds a UPI link carrying the server-computed amount", () => {
     const link = buildUpiLink({
-      upiId: "8434232412@ptyes",
+      upiId: "payee@example",
       payeeName: "HRMS Platform",
       amountPaise: 53_100,
       note: "HRMS 10 seats",
     });
-    expect(link).toContain("pa=8434232412%40ptyes");
+    expect(link).toContain("pa=payee%40example");
     expect(link).toContain("am=531.00");
     expect(link).toContain("cu=INR");
   });

@@ -172,7 +172,7 @@ export default async function OrderPage({ params }: { params: Promise<{ id: stri
                 <ConfirmPayment
                   orderId={order.id}
                   confirmationMode={view.confirmationMode}
-                  hasIssuedCode={order.issuedCodeHash != null}
+                  hasIssuedCode={order.hasIssuedCode}
                   expiresAt={order.expiresAt.toISOString()}
                   status={order.status}
                   payablePaise={order.payablePaise}

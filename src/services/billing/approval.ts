@@ -7,6 +7,7 @@ import { notify } from "@/lib/notify";
 import { validateCoupon } from "@/domain/billing/pricing";
 import { type ConfirmationMode, transition } from "@/domain/billing/orderMachine";
 import { paidPeriodEnd, paidPeriodStart } from "@/domain/billing/period";
+import { ORDER_CHANGED_MESSAGE, writeOrderIfUnchanged } from "./orderWrite";
 
 /**
  * The moment money becomes entitlement.
@@ -66,7 +67,7 @@ export async function settleApproval(
 
   if (!result.ok) {
     if (result.failure === "EXPIRED") {
-      await prisma.paymentOrder.update({ where: { id: order.id }, data: { status: "EXPIRED" } });
+      await writeOrderIfUnchanged(order, { status: "EXPIRED" });
     }
     throw new ConflictError(result.message ?? "This request can no longer be approved.");
   }
@@ -142,6 +143,36 @@ export async function settleApproval(
   let periodEnd = paidPeriodEnd(now, order.periodMonths);
 
   const updated = await prisma.$transaction(async (tx) => {
+    /**
+     * Claimed first, and only from the row this approval was decided on.
+     *
+     * Everything above read `order` before this transaction began, so two
+     * approvals of one order -- the button pressed twice, two superadmins, the
+     * issued code typed in two tabs -- both got this far believing it was
+     * still waiting. The write used to be unconditional, and both committed:
+     * the paid period extended twice and two history rows for one payment. A
+     * request rejected in between was flipped to APPROVED and credited too,
+     * and so was one resubmitted with a reference nobody had looked at.
+     *
+     * The claim is one conditional statement (`writeOrderIfUnchanged`), so
+     * Postgres settles it: the second waits for the first's row lock, finds
+     * the row changed and updates nothing. Nothing below runs for it.
+     */
+    const saved = await writeOrderIfUnchanged(
+      order,
+      {
+        status: "APPROVED",
+        reviewedAt: now,
+        reviewedById: actorUserId,
+        reviewNote: note ?? null,
+        // A consumed code must not remain verifiable.
+        issuedCodeHash: null,
+        issuedCodeCipher: null,
+      },
+      tx,
+    );
+    if (!saved) return null;
+
     const existing = await tx.subscription.findUnique({
       where: { organizationId: order.organizationId },
     });
@@ -216,19 +247,6 @@ export async function settleApproval(
       });
     }
 
-    const saved = await tx.paymentOrder.update({
-      where: { id: order.id },
-      data: {
-        status: "APPROVED",
-        reviewedAt: now,
-        reviewedById: actorUserId,
-        reviewNote: note ?? null,
-        // A consumed code must not remain verifiable.
-        issuedCodeHash: null,
-        issuedCodeCipher: null,
-      },
-    });
-
     await tx.paymentOrderEvent.create({
       data: {
         paymentOrderId: order.id,
@@ -241,6 +259,15 @@ export async function settleApproval(
 
     return saved;
   });
+
+  if (!updated) {
+    // Somebody else moved this order first. If that was an approval, this one
+    // is a repeat and answers like the idempotent path above, crediting
+    // nothing; anything else (rejected, more information asked) is a conflict.
+    const current = await prisma.paymentOrder.findUnique({ where: { id: order.id } });
+    if (current?.status === "APPROVED") return current;
+    throw new ConflictError(ORDER_CHANGED_MESSAGE);
+  }
 
   await writeAudit(ctx, {
     action: "payment.approved",

@@ -17,6 +17,8 @@ import {
   resolveConfirmationCode,
 } from "@/domain/billing/paymentCodes";
 import { settleApproval } from "./approval";
+import { type CustomerOrder, toCustomerOrder } from "./customerOrder";
+import { ORDER_CHANGED_MESSAGE, writeOrderIfUnchanged } from "./orderWrite";
 import {
   type CouponSpec,
   buildUpiLink,
@@ -55,7 +57,11 @@ export async function getPlatformPricing(): Promise<PlatformPricing> {
   return {
     pricePerUserPaise: settings?.pricePerUserPaise ?? 5_900,
     currency: settings?.currency ?? "INR",
-    upiId: settings?.paymentUpiId ?? "8434232412@ptyes",
+    // The payee is the platform owner's to set (Platform -> Settings, or
+    // PAYMENT_UPI_ID before the settings row exists). There is no literal
+    // fallback: an unset payee is empty, and `createOrder` refuses to take an
+    // order rather than point a customer's money at a default account.
+    upiId: settings?.paymentUpiId?.trim() || process.env.PAYMENT_UPI_ID?.trim() || "",
     payeeName: settings?.paymentPayeeName ?? "HRMS Platform",
     windowMinutes: settings?.paymentWindowMinutes ?? 240,
     confirmationMode: (settings?.confirmationMode ?? "BOTH") as ConfirmationMode,
@@ -336,7 +342,7 @@ export async function listCheckoutCoupons(
 export async function createOrder(
   ctx: AuthContext,
   input: { userCount: number; periodMonths?: number; couponCode?: string | null },
-): Promise<PaymentOrder> {
+): Promise<CustomerOrder> {
   requireOrg(ctx);
   requirePermission(ctx, "org.billing.manage");
   // Deliberately not requireWritable: an organisation whose subscription has
@@ -352,6 +358,9 @@ export async function createOrder(
   await enforce("paymentCode", `order:${ctx.organizationId}`, { limit: 10, windowSeconds: 3_600 });
 
   const pricing = await getPlatformPricing();
+  if (!pricing.upiId) {
+    throw new ConflictError("Payments are not set up on this platform yet. Please contact support.");
+  }
   const quote = await quoteOrder(ctx, input);
   if (quote.couponError && input.couponCode?.trim()) {
     throw new ValidationError(quote.couponError);
@@ -441,7 +450,7 @@ export async function createOrder(
     },
   });
 
-  return order;
+  return toCustomerOrder(order);
 }
 
 function toState(order: PaymentOrder): OrderState {
@@ -455,15 +464,26 @@ function toState(order: PaymentOrder): OrderState {
   };
 }
 
+/**
+ * The answer when another request changed the order between this one's read
+ * and its write. A confirmation that lands after the order was approved (a
+ * second tap, a second tab) is told where it ended up; anything else is a
+ * conflict to reload, never a write over somebody else's.
+ */
+async function orderThatMovedFirst(orderId: string): Promise<CustomerOrder> {
+  const current = await prisma.paymentOrder.findUnique({ where: { id: orderId } });
+  if (current?.status === "APPROVED") return toCustomerOrder(current);
+  throw new ConflictError(ORDER_CHANGED_MESSAGE);
+}
+
 /** Marks an order expired the moment anybody looks at it past its window. */
 async function settleExpiry(order: PaymentOrder): Promise<PaymentOrder> {
   if (!isExpired(toState(order), new Date())) return order;
   if (order.status === "EXPIRED") return order;
 
-  const updated = await prisma.paymentOrder.update({
-    where: { id: order.id },
-    data: { status: "EXPIRED" },
-  });
+  const updated = await writeOrderIfUnchanged(order, { status: "EXPIRED" });
+  // Somebody else moved it first; show the order as it is now.
+  if (!updated) return prisma.paymentOrder.findUniqueOrThrow({ where: { id: order.id } });
   await prisma.paymentOrderEvent.create({
     data: {
       paymentOrderId: order.id,
@@ -476,7 +496,7 @@ async function settleExpiry(order: PaymentOrder): Promise<PaymentOrder> {
 }
 
 export interface OrderView {
-  order: PaymentOrder;
+  order: CustomerOrder;
   minutesRemaining: number;
   expired: boolean;
   actions: string[];
@@ -508,7 +528,7 @@ export async function getOrderForOrg(ctx: AuthContext, orderId: string): Promise
   });
 
   return {
-    order,
+    order: toCustomerOrder(order),
     paymentCode:
       bound && !bound.revokedAt
         ? {
@@ -530,7 +550,7 @@ export async function getOrderForOrg(ctx: AuthContext, orderId: string): Promise
   };
 }
 
-export async function listOrdersForOrg(ctx: AuthContext): Promise<PaymentOrder[]> {
+export async function listOrdersForOrg(ctx: AuthContext): Promise<CustomerOrder[]> {
   requireOrg(ctx);
   requirePermission(ctx, "org.billing.manage");
 
@@ -542,7 +562,8 @@ export async function listOrdersForOrg(ctx: AuthContext): Promise<PaymentOrder[]
 
   // Expiry is evaluated on read as well as on write, so a stale row can never
   // be presented as still actionable.
-  return Promise.all(orders.map(settleExpiry));
+  const settled = await Promise.all(orders.map(settleExpiry));
+  return settled.map(toCustomerOrder);
 }
 
 /** "I have paid" — the organisation supplies a UTR / reference. */
@@ -550,7 +571,7 @@ export async function submitReference(
   ctx: AuthContext,
   orderId: string,
   input: { reference: string; note?: string },
-): Promise<PaymentOrder> {
+): Promise<CustomerOrder> {
   requireOrg(ctx);
   requirePermission(ctx, "org.billing.manage");
 
@@ -570,16 +591,14 @@ export async function submitReference(
   );
   if (!result.ok || !result.next) throw new ConflictError(result.message ?? "That is not possible now.");
 
-  const updated = await prisma.paymentOrder.update({
-    where: { id: order.id },
-    data: {
-      status: result.next.status,
-      transactionRef: result.next.transactionRef,
-      confirmationCode: result.next.confirmationCode,
-      payerNote: input.note ?? null,
-      submittedAt: now,
-    },
+  const updated = await writeOrderIfUnchanged(order, {
+    status: result.next.status,
+    transactionRef: result.next.transactionRef,
+    confirmationCode: result.next.confirmationCode,
+    payerNote: input.note ?? null,
+    submittedAt: now,
   });
+  if (!updated) return orderThatMovedFirst(order.id);
 
   await prisma.paymentOrderEvent.create({
     data: {
@@ -605,7 +624,7 @@ export async function submitReference(
     link: "/platform/payments",
   });
 
-  return updated;
+  return toCustomerOrder(updated);
 }
 
 /**
@@ -623,7 +642,7 @@ export async function submitReference(
  * reference: same state, same review queue, same approval, so the platform
  * owner still sees every zero-rated order before seats are granted.
  */
-export async function submitNothingToPay(ctx: AuthContext, orderId: string): Promise<PaymentOrder> {
+export async function submitNothingToPay(ctx: AuthContext, orderId: string): Promise<CustomerOrder> {
   requireOrg(ctx);
   requirePermission(ctx, "org.billing.manage");
 
@@ -648,18 +667,16 @@ export async function submitNothingToPay(ctx: AuthContext, orderId: string): Pro
   );
   if (!result.ok || !result.next) throw new ConflictError(result.message ?? "That is not possible now.");
 
-  const updated = await prisma.paymentOrder.update({
-    where: { id: order.id },
-    data: {
-      status: result.next.status,
-      transactionRef: null,
-      confirmationCode: null,
-      // Written where a reviewer looks, so the empty reference reads as a
-      // fact and not as something the organisation forgot.
-      payerNote: "Nothing to pay: the coupon covered the full amount.",
-      submittedAt: now,
-    },
+  const updated = await writeOrderIfUnchanged(order, {
+    status: result.next.status,
+    transactionRef: null,
+    confirmationCode: null,
+    // Written where a reviewer looks, so the empty reference reads as a
+    // fact and not as something the organisation forgot.
+    payerNote: "Nothing to pay: the coupon covered the full amount.",
+    submittedAt: now,
   });
+  if (!updated) return orderThatMovedFirst(order.id);
 
   await prisma.paymentOrderEvent.create({
     data: {
@@ -685,7 +702,7 @@ export async function submitNothingToPay(ctx: AuthContext, orderId: string): Pro
     link: "/platform/payments",
   });
 
-  return updated;
+  return toCustomerOrder(updated);
 }
 
 /** Mode CODE: the organisation enters the code the Superadmin gave them. */
@@ -693,7 +710,7 @@ export async function submitConfirmationCode(
   ctx: AuthContext,
   orderId: string,
   code: string,
-): Promise<PaymentOrder> {
+): Promise<CustomerOrder> {
   requireOrg(ctx);
   requirePermission(ctx, "org.billing.manage");
   await enforce("paymentCode", `verify:${ctx.organizationId}:${orderId}`);
@@ -730,7 +747,11 @@ export async function submitConfirmationCode(
     now,
   });
 
-  if (resolved.kind === "ADVANCE") return confirmWithAdvanceCode(ctx, order, code, resolved, now, pricing.confirmationMode);
+  if (resolved.kind === "ADVANCE") {
+    return toCustomerOrder(
+      await confirmWithAdvanceCode(ctx, order, code, resolved, now, pricing.confirmationMode),
+    );
+  }
 
   // The machine decides *whether* the code may be checked; bcrypt decided
   // whether it matches. Verification is injected so hashing stays out of the
@@ -753,14 +774,19 @@ export async function submitConfirmationCode(
     throw new ConflictError(why ?? result.message ?? "That confirmation code is not correct.");
   }
 
-  const updated = await prisma.paymentOrder.update({
-    where: { id: order.id },
-    data: {
-      status: result.next!.status,
-      confirmationCode: result.next!.confirmationCode,
-      submittedAt: now,
-    },
+  /**
+   * Written only onto the row the code was checked against. The same code
+   * typed in two tabs used to have the second request put an already
+   * APPROVED order back to AWAITING_CONFIRMATION here -- and then approve it,
+   * and credit it, a second time. Now the second request finds the row
+   * changed and answers with where the first one left it.
+   */
+  const updated = await writeOrderIfUnchanged(order, {
+    status: result.next!.status,
+    confirmationCode: result.next!.confirmationCode,
+    submittedAt: now,
   });
+  if (!updated) return orderThatMovedFirst(order.id);
 
   await prisma.paymentOrderEvent.create({
     data: {
@@ -794,7 +820,7 @@ export async function submitConfirmationCode(
       mode: pricing.confirmationMode,
       note: "Approved by the code issued for this request",
       via: "issued_code",
-    });
+    }).then(toCustomerOrder);
   }
 
   await notify.toSuperadmins({
@@ -804,7 +830,7 @@ export async function submitConfirmationCode(
     link: "/platform/payments",
   });
 
-  return updated;
+  return toCustomerOrder(updated);
 }
 
 /**
@@ -846,9 +872,11 @@ async function confirmWithAdvanceCode(
     });
     if (spent.count === 0) throw new ConflictError("That payment code has already been used.");
 
-    const saved = await tx.paymentOrder.update({
-      where: { id: order.id },
-      data: {
+    // Onto the row the code was checked against, or not at all: the throw
+    // rolls back the spend above with it.
+    const saved = await writeOrderIfUnchanged(
+      order,
+      {
         status: result.next!.status,
         confirmationCode: result.next!.confirmationCode,
         submittedAt: now,
@@ -859,7 +887,9 @@ async function confirmWithAdvanceCode(
             }
           : {}),
       },
-    });
+      tx,
+    );
+    if (!saved) throw new ConflictError(ORDER_CHANGED_MESSAGE);
 
     await tx.paymentOrderEvent.create({
       data: {
@@ -904,7 +934,7 @@ async function confirmWithAdvanceCode(
  * to type them again; the button is the confirmation. Everything else is the
  * advance-code path.
  */
-export async function submitBoundCode(ctx: AuthContext, orderId: string): Promise<PaymentOrder> {
+export async function submitBoundCode(ctx: AuthContext, orderId: string): Promise<CustomerOrder> {
   requireOrg(ctx);
   requirePermission(ctx, "org.billing.manage");
 
@@ -937,7 +967,9 @@ export async function submitBoundCode(ctx: AuthContext, orderId: string): Promis
   // The digits are kept on the order as the confirmation, the same as if they
   // had been typed: the owner's queue shows what confirmed it.
   const digits = decryptOptional(bound.codeCipher) ?? "";
-  return confirmWithAdvanceCode(ctx, order, digits, { code: spec, reprice: false }, now, pricing.confirmationMode);
+  return toCustomerOrder(
+    await confirmWithAdvanceCode(ctx, order, digits, { code: spec, reprice: false }, now, pricing.confirmationMode),
+  );
 }
 
 /**
