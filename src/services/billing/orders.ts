@@ -705,6 +705,9 @@ export async function submitNothingToPay(ctx: AuthContext, orderId: string): Pro
   return toCustomerOrder(updated);
 }
 
+/** Tries one issued code gets before it stops being checked at all. */
+const MAX_CODE_ATTEMPTS = 5;
+
 /** Mode CODE: the organisation enters the code the Superadmin gave them. */
 export async function submitConfirmationCode(
   ctx: AuthContext,
@@ -738,7 +741,35 @@ export async function submitConfirmationCode(
    * not share a path below.
    */
   const state = toState(order);
-  const orderCodeMatches = state.issuedCodeHash ? await verifyCode(code, state.issuedCodeHash) : false;
+
+  /**
+   * One attempt is reserved in the database before the code is compared.
+   *
+   * The cap used to be checked on the row as read and the count written back
+   * afterwards, so guesses sent in parallel all saw the same count and each
+   * got its own bcrypt compare. The reservation is one conditional UPDATE: it
+   * succeeds only while attempts remain and only on the row this request
+   * read, so at most MAX_CODE_ATTEMPTS compares ever run against one code.
+   * The machine still decides on `state` (the count before this attempt).
+   */
+  let checked = order;
+  if (order.issuedCodeHash && order.codeAttemptCount < MAX_CODE_ATTEMPTS) {
+    const reserved = await prisma.paymentOrder.updateMany({
+      where: {
+        id: order.id,
+        status: order.status,
+        updatedAt: order.updatedAt,
+        codeAttemptCount: { lt: MAX_CODE_ATTEMPTS },
+      },
+      data: { codeAttemptCount: { increment: 1 } },
+    });
+    if (reserved.count !== 1) return orderThatMovedFirst(order.id);
+    checked = await prisma.paymentOrder.findUniqueOrThrow({ where: { id: order.id } });
+  }
+  // Compared only when this request holds a reserved attempt: once the cap is
+  // reached the issued code is not checked at all, not even to say "wrong".
+  const orderCodeMatches =
+    state.issuedCodeHash && checked !== order ? await verifyCode(code, state.issuedCodeHash) : false;
   const resolved = resolveConfirmationCode({
     orderCodeMatches,
     advance: orderCodeMatches ? null : await findAdvanceCode(code),
@@ -749,7 +780,7 @@ export async function submitConfirmationCode(
 
   if (resolved.kind === "ADVANCE") {
     return toCustomerOrder(
-      await confirmWithAdvanceCode(ctx, order, code, resolved, now, pricing.confirmationMode),
+      await confirmWithAdvanceCode(ctx, checked, code, resolved, now, pricing.confirmationMode),
     );
   }
 
@@ -760,16 +791,16 @@ export async function submitConfirmationCode(
   const result = transition(
     state,
     { type: "SUBMIT_CODE", code },
-    { now, mode: pricing.confirmationMode, verifyCode: () => resolved.kind === "ORDER" },
+    {
+      now,
+      mode: pricing.confirmationMode,
+      verifyCode: () => resolved.kind === "ORDER",
+      maxCodeAttempts: MAX_CODE_ATTEMPTS,
+    },
   );
 
   if (!result.ok) {
-    if (result.next) {
-      await prisma.paymentOrder.update({
-        where: { id: order.id },
-        data: { codeAttemptCount: result.next.codeAttemptCount },
-      });
-    }
+    // A wrong code was already counted: the reservation above is the attempt.
     const why = resolved.kind === "NONE" ? resolved.check?.message : null;
     throw new ConflictError(why ?? result.message ?? "That confirmation code is not correct.");
   }
@@ -781,7 +812,7 @@ export async function submitConfirmationCode(
    * and credit it, a second time. Now the second request finds the row
    * changed and answers with where the first one left it.
    */
-  const updated = await writeOrderIfUnchanged(order, {
+  const updated = await writeOrderIfUnchanged(checked, {
     status: result.next!.status,
     confirmationCode: result.next!.confirmationCode,
     submittedAt: now,

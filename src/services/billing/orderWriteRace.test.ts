@@ -111,6 +111,7 @@ const approvals = () =>
 
 beforeEach(() => {
   vi.clearAllMocks();
+  vi.mocked(verifyCode).mockImplementation(async () => true);
 });
 
 describe("the issued code typed in two tabs", () => {
@@ -121,35 +122,51 @@ describe("the issued code typed in two tabs", () => {
       codeIssuedById: "superadmin_1",
       codeIssuedAt: new Date(),
     });
-
-    // Both requests read the order and reach the code check before either
-    // writes; then the first runs to the end, and only then the second.
-    const bothRead = deferred();
-    const secondMayGo = deferred();
-    let arrived = 0;
-    vi.mocked(verifyCode).mockImplementation(async () => {
-      arrived += 1;
-      if (arrived === 1) {
-        await bothRead.promise;
-      } else {
-        bothRead.resolve();
-        await secondMayGo.promise;
-      }
-      return true;
-    });
-
+    // Tab A reads the order and is held; tab B runs to the end; then A
+    // carries on with what it read.
+    const hold = holdFirstSettingsRead();
     const tabA = orders.submitConfirmationCode(orgCtx, "order_1", "123456");
-    const tabB = orders.submitConfirmationCode(orgCtx, "order_1", "123456");
+    await hold.reached;
+    const second = await orders.submitConfirmationCode(orgCtx, "order_1", "123456");
+    hold.release();
     const first = await tabA;
-    secondMayGo.resolve();
-    const second = await tabB;
 
-    expect(first.status).toBe("APPROVED");
     expect(second.status).toBe("APPROVED");
+    expect(first.status).toBe("APPROVED");
     expect(fake.db.state.paymentOrders.get("order_1")?.status).toBe("APPROVED");
     expect(fake.db.state.subscriptionHistory).toHaveLength(1);
     expect(fake.db.state.paymentOrderEvents.filter((e) => e.toStatus === "APPROVED")).toHaveLength(1);
     expect(approvals()).toBe(1);
+  });
+});
+
+describe("guesses at an issued code", () => {
+  it("are capped even when sent in parallel", async () => {
+    seed({
+      status: "AWAITING_CONFIRMATION",
+      issuedCodeHash: "hash-of-the-issued-code",
+      codeIssuedById: "superadmin_1",
+      codeAttemptCount: 4,
+    });
+    vi.mocked(verifyCode).mockImplementation(async () => false);
+    // Both guesses read four attempts used; only one may be compared.
+    const hold = holdFirstSettingsRead();
+    const guessA = orders.submitConfirmationCode(orgCtx, "order_1", "111111");
+    await hold.reached;
+    await expect(orders.submitConfirmationCode(orgCtx, "order_1", "222222")).rejects.toThrow();
+    hold.release();
+    await expect(guessA).rejects.toThrow();
+
+    expect(verifyCode).toHaveBeenCalledTimes(1);
+    expect(fake.db.state.paymentOrders.get("order_1")?.codeAttemptCount).toBe(5);
+  });
+
+  it("stop being compared at all once the cap is reached", async () => {
+    seed({ status: "AWAITING_CONFIRMATION", issuedCodeHash: "hash", codeIssuedById: "superadmin_1", codeAttemptCount: 5 });
+    await expect(orders.submitConfirmationCode(orgCtx, "order_1", "123456")).rejects.toThrow();
+    expect(fake.db.state.paymentOrders.get("order_1")?.codeAttemptCount).toBe(5);
+    expect(verifyCode).not.toHaveBeenCalled();
+    expect(fake.db.state.paymentOrders.get("order_1")?.status).toBe("AWAITING_CONFIRMATION");
   });
 });
 

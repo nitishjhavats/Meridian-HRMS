@@ -122,7 +122,12 @@ describe("guessing is bounded from every direction", () => {
   it("a wrong code still counts against the order's attempts", () => {
     const body = bodyOf(ORDERS, "export async function submitConfirmationCode");
     expect(body).toMatch(/verifyCode: \(\) => resolved\.kind === "ORDER"/);
-    expect(body).toMatch(/codeAttemptCount: result\.next\.codeAttemptCount/);
+    // Counted before the compare, in one conditional write, so parallel
+    // guesses cannot each read the same count (behaviour: orderWriteRace.test.ts).
+    const reserve = body.indexOf("codeAttemptCount: { lt: MAX_CODE_ATTEMPTS }");
+    expect(reserve).toBeGreaterThan(-1);
+    expect(body).toMatch(/data: \{ codeAttemptCount: \{ increment: 1 \} \}/);
+    expect(reserve).toBeLessThan(body.indexOf("await verifyCode("));
   });
 });
 

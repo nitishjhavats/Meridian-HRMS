@@ -60,7 +60,11 @@ export async function updateSettings(
       throw new ValidationError("That price looks wrong — it is over ₹10,000 per user.");
     }
   }
-  if (patch.paymentUpiId != null && !UPI_PATTERN.test(patch.paymentUpiId.trim())) {
+  // An empty payee is "not set yet", not a malformed one: a fresh install has
+  // no default payee, and refusing it here refused every other setting on the
+  // same form. Empty is never written (see below); with no payee saved, orders
+  // use PAYMENT_UPI_ID, and are refused when that is unset too.
+  if (patch.paymentUpiId?.trim() && !UPI_PATTERN.test(patch.paymentUpiId.trim())) {
     throw new ValidationError("That does not look like a UPI ID (for example name@bank).");
   }
   if (patch.paymentWindowMinutes != null && (patch.paymentWindowMinutes < 15 || patch.paymentWindowMinutes > 10_080)) {
@@ -110,7 +114,8 @@ export async function updateSettings(
     where: { id: "singleton" },
     data: {
       ...rest,
-      ...(rest.paymentUpiId ? { paymentUpiId: rest.paymentUpiId.trim() } : {}),
+      // Undefined leaves the stored payee alone; an empty box never clears it.
+      paymentUpiId: rest.paymentUpiId?.trim() || undefined,
       ...(invoicePrefix !== undefined ? { invoicePrefix } : {}),
       updatedById: ctx.userId,
     },

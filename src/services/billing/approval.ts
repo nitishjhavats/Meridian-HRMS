@@ -183,8 +183,16 @@ export async function settleApproval(
     const nextSeats = Math.max(existing?.seats ?? 0, order.userCount);
 
     if (existing) {
-      await tx.subscription.update({
-        where: { organizationId: order.organizationId },
+      /**
+       * Onto the subscription this period was computed from, or not at all.
+       * Two different orders of one organisation approved at the same moment
+       * both read the same period end; the second used to overwrite the first
+       * with the same new end, and one payment's months were lost. Now the
+       * second finds the row changed, the whole approval rolls back (its claim
+       * on the order included), and the approver is asked to try again.
+       */
+      const extended = await tx.subscription.updateMany({
+        where: { organizationId: order.organizationId, updatedAt: existing.updatedAt },
         data: {
           seats: nextSeats,
           status: "ACTIVE",
@@ -196,6 +204,9 @@ export async function settleApproval(
           pricePerUserPaise: order.pricePerUserPaise,
         },
       });
+      if (extended.count !== 1) {
+        throw new ConflictError("Another payment for this organisation was confirmed at the same moment. Please try again in a moment.");
+      }
     } else {
       await tx.subscription.create({
         data: {

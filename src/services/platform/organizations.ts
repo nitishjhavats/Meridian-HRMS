@@ -10,6 +10,7 @@ import { hashPassword, generateTemporaryPassword } from "@/lib/auth/password";
 import { signInUrl } from "@/services/employees/credentials";
 import { MODULES, type ModuleKey, isModuleKey, resolveModules } from "@/lib/features";
 import { DEFAULT_ATTENDANCE_POLICY } from "@/domain/attendance/policy";
+import { withoutIssuedCode } from "@/services/billing/customerOrder";
 import { DEFAULT_FACE_MATCH_POLICY } from "@/domain/attendance/faceMatch";
 import { DEFAULT_PAYROLL_POLICY } from "@/domain/payroll/policy";
 import { summariseSeats } from "@/domain/billing/seats";
@@ -162,6 +163,8 @@ export async function getOrganization(ctx: AuthContext, organizationId: string) 
 
   return {
     ...org,
+    // The issued code stays on the server here too (see withoutIssuedCode).
+    paymentOrders: org.paymentOrders.map(withoutIssuedCode),
     activeEmployees,
     seats: summariseSeats(org.subscription?.seats ?? 0, activeEmployees),
     modules: resolveModules({ grants, settings }),
