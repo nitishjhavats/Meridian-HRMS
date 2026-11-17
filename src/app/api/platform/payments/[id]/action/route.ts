@@ -8,6 +8,7 @@ import {
   requestMoreInfo,
   revealIssuedCode,
 } from "@/services/platform/payments";
+import { withoutIssuedCode } from "@/services/billing/customerOrder";
 
 /**
  * Every review decision on a payment goes through one endpoint, so the state
@@ -27,15 +28,15 @@ export const POST = route<{ id: string }>(async (request, { params }) => {
 
   switch (body.action) {
     case "approve":
-      return json({ order: await approveOrder(ctx, params.id, body.note) });
+      return json({ order: withoutIssuedCode(await approveOrder(ctx, params.id, body.note)) });
     case "reject":
-      return json({ order: await rejectOrder(ctx, params.id, body.note) });
+      return json({ order: withoutIssuedCode(await rejectOrder(ctx, params.id, body.note)) });
     case "request_info":
-      return json({ order: await requestMoreInfo(ctx, params.id, body.note) });
+      return json({ order: withoutIssuedCode(await requestMoreInfo(ctx, params.id, body.note)) });
     case "issue_code": {
       const result = await issueConfirmationCode(ctx, params.id);
       // Returned once, to the platform owner, to pass on out of band.
-      return json({ code: result.code, order: result.order });
+      return json({ code: result.code, order: withoutIssuedCode(result.order) });
     }
     case "reveal_code":
       return json({ code: await revealIssuedCode(ctx, params.id) });

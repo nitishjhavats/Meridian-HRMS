@@ -18,6 +18,7 @@ import {
 import { getPlatformPricing } from "../billing/orders";
 import { settleApproval } from "../billing/approval";
 import { ORDER_CHANGED_MESSAGE, writeOrderIfUnchanged } from "../billing/orderWrite";
+import { withoutIssuedCode } from "../billing/customerOrder";
 import { randomNumericCode, sha256 } from "@/lib/crypto/field";
 
 /**
@@ -429,10 +430,9 @@ export async function getOrderDetail(ctx: AuthContext, orderId: string) {
 
   const now = new Date();
   return {
-    ...order,
+    ...withoutIssuedCode(order),
     expired: isExpired(toState(order), now),
     minutesRemaining: minutesRemaining(toState(order), now),
-    hasIssuedCode: order.issuedCodeHash != null,
   };
 }
 

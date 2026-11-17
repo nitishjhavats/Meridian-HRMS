@@ -52,6 +52,7 @@ function seed() {
     billingMode: "PAID",
     currentPeriodStart: new Date("2026-03-01T00:00:00.000Z"),
     currentPeriodEnd: PERIOD_END,
+    updatedAt: new Date("2026-03-01T00:00:00.000Z"),
   });
   return order;
 }
@@ -128,6 +129,57 @@ describe("settleApproval credits a payment exactly once", () => {
     expect(fake.db.state.paymentOrders.get(order.id)?.status).toBe("AWAITING_CONFIRMATION");
     expect(fake.db.state.subscriptionHistory).toHaveLength(0);
     expect(writeAudit).not.toHaveBeenCalled();
+  });
+
+  it("two different orders of one organisation approved at once lose no months", async () => {
+    const first = seed();
+    const second = orderRow({ id: "order_2", orderNumber: "ORD-2026-0002" });
+    fake.db.state.paymentOrders.set(second.id, second);
+
+    // The first approval reads the subscription and is held there, inside its
+    // transaction; the second approval runs to the end; then the first goes on.
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let reached!: () => void;
+    const parked = new Promise<void>((r) => (reached = r));
+    const transaction = fake.db.prisma.$transaction.bind(fake.db.prisma);
+    let held = false;
+    fake.db.prisma.$transaction = (async (callback: (tx: unknown) => Promise<unknown>) =>
+      transaction(async (tx) => {
+        const sub = (tx as { subscription: { findUnique: (a: unknown) => Promise<unknown> } }).subscription;
+        const read = sub.findUnique.bind(sub);
+        sub.findUnique = async (args: unknown) => {
+          const row = await read(args);
+          if (!held) {
+            held = true;
+            reached();
+            await gate;
+          }
+          return row;
+        };
+        return callback(tx);
+      })) as typeof fake.db.prisma.$transaction;
+
+    const approvingFirst = settleApproval(ctx, first, input);
+    await parked;
+    await settleApproval(ctx, second, input);
+    release();
+    await expect(approvingFirst).rejects.toThrow(/same moment/);
+
+    // Twelve months from the second payment are there; the first rolled back
+    // entirely (order, history and all) and can simply be approved again.
+    expect(fake.db.state.subscriptions.get(first.organizationId)?.currentPeriodEnd).toEqual(
+      paidPeriodEnd(PERIOD_END, 12),
+    );
+    expect(fake.db.state.paymentOrders.get("order_1")?.status).toBe("AWAITING_CONFIRMATION");
+    expect(fake.db.state.subscriptionHistory).toHaveLength(1);
+
+    fake.db.prisma.$transaction = transaction;
+    await settleApproval(ctx, fake.db.state.paymentOrders.get("order_1")!, input);
+    expect(fake.db.state.subscriptions.get(first.organizationId)?.currentPeriodEnd).toEqual(
+      paidPeriodEnd(paidPeriodEnd(PERIOD_END, 12), 12),
+    );
+    expect(fake.db.state.subscriptionHistory).toHaveLength(2);
   });
 
   it("a single approval still credits seats and the period", async () => {

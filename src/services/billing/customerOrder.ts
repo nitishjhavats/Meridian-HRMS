@@ -69,3 +69,20 @@ export function toCustomerOrder(order: PaymentOrder): CustomerOrder {
     hasIssuedCode: order.issuedCodeHash != null,
   };
 }
+
+/**
+ * The platform owner's view of an order: everything on the row except the
+ * issued code itself.
+ *
+ * The superadmin already has `reveal_code` for reading back a code they
+ * issued, on purpose and one at a time. Shipping the hash and the cipher with
+ * every order detail and every review action put them in browser memory, dev
+ * tools and any proxy log on the way for no reason; `hasIssuedCode` is what the
+ * screens actually use.
+ */
+export function withoutIssuedCode<T extends Pick<PaymentOrder, "issuedCodeHash" | "issuedCodeCipher">>(
+  order: T,
+): Omit<T, "issuedCodeHash" | "issuedCodeCipher"> & { hasIssuedCode: boolean } {
+  const { issuedCodeHash, issuedCodeCipher: _cipher, ...rest } = order;
+  return { ...rest, hasIssuedCode: issuedCodeHash != null };
+}
